@@ -6,7 +6,8 @@ from typing import Dict, List, Optional
 import random
 from datetime import datetime
 import re
-
+import uuid
+from datasets import Dataset
 import datasets
 from loguru import logger
 from tqdm.asyncio import tqdm
@@ -24,7 +25,8 @@ Problem statement:
 
 class IOIEvaluator:
     def __init__(self, org_id: str, model_id: str, num_generations: int = 50, num_retries: int = 10, 
-                 concurrency: int = 10, n_problems: Optional[int] = None, dry_run: bool = False):
+                 concurrency: int = 10, n_problems: Optional[int] = None, dry_run: bool = False,
+                 override: bool = False):
         self.org_id = org_id
         self.model_id = model_id
         self.num_generations = num_generations
@@ -32,7 +34,9 @@ class IOIEvaluator:
         self.concurrency = concurrency
         self.n_problems = n_problems
         self.dry_run = dry_run
+        self.override = override
         self.dataset = None
+        self.previous_results = None
         
         # Create organization and model directories
         self.org_dir = Path(org_id)
@@ -50,6 +54,42 @@ class IOIEvaluator:
 
         if dry_run:
             logger.warning("Running in dry-run mode - no actual LLM calls will be made")
+
+    async def load_previous_results(self):
+        """Load previous results from HuggingFace Hub or local files."""
+        if self.override:
+            logger.info("Override mode enabled - not loading previous results")
+            return None
+            
+        try:
+            # First try loading from HuggingFace Hub
+            model_name = f"dummy-{self.model_id}" if self.dry_run else self.model_id
+            repo_name = f"{self.org_id}/ioi-eval-{model_name.replace('/', '_')}"
+            
+            try:
+                logger.info(f"Attempting to load previous results from HuggingFace Hub: {repo_name}")
+                dataset = datasets.load_dataset(repo_name)
+                if dataset and 'train' in dataset:
+                    logger.info(f"Loaded previous results from HuggingFace Hub: {len(dataset['train'])} entries")
+                    return list(dataset['train'])
+            except Exception as e:
+                logger.info(f"Could not load from HuggingFace Hub: {str(e)}")
+            
+            # If hub loading failed, try local file
+            dataset_file = self.org_dir / f"{self.model_id}_dataset.json"
+            if dataset_file.exists():
+                logger.info(f"Loading previous results from local file: {dataset_file}")
+                with open(dataset_file) as f:
+                    results = json.load(f)
+                    logger.info(f"Loaded previous results from local file: {len(results)} entries")
+                    return results
+                    
+            logger.info("No previous results found")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error loading previous results: {str(e)}")
+            return None
 
     def load_dataset(self):
         """Load the IOI 2024 dataset from Huggingface."""
@@ -75,7 +115,7 @@ class IOIEvaluator:
 
         return subtasks[subtask_ids.index(max(subtask_ids))]
 
-    def get_dummy_response(self, prompt: str) -> Dict:
+    def get_dummy_response(self, prompt: str, seed: int) -> Dict:
         """Generate a dummy response for dry runs."""
         dummy_code = """```cpp
 int main() {
@@ -88,7 +128,7 @@ int main() {
             "code": "int main() {\n    // This is a dummy solution\n    return 0;\n}",
             "language": "cpp",
             "model_kwargs": {
-                "seed": random.randint(0, 100000),
+                "seed": seed,
             },
             "metadata": {
                 "usage": {
@@ -122,19 +162,16 @@ int main() {
             logger.error(f"Failed to extract code: {str(e)}")
             return "", "unknown"
 
-    async def call_llm(self, prompt: str) -> Dict:
+    async def call_llm(self, prompt: str, seed: int) -> Dict:
         """Call the LLM using LiteLLM's built-in retry mechanism."""
         try:
             if self.dry_run:
-                return self.get_dummy_response(prompt)
+                return self.get_dummy_response(prompt, seed)
                 
-            # Set random seed for reproducibility
-            random_seed = random.randint(0, 100000)
-            
             response = await litellm.acompletion(
                 model=self.model_id,
                 messages=[{"role": "user", "content": prompt, "cache_control": {"type": "ephemeral"}}],
-                seed=random_seed,
+                seed=seed,
                 num_retries=self.num_retries,
             )
             
@@ -184,7 +221,7 @@ int main() {
                 "code": code,
                 "language": language,
                 "model_kwargs": {
-                    "seed": random_seed,
+                    "seed": seed,
                 },
                 "metadata": {
                     "usage": usage,
@@ -198,7 +235,7 @@ int main() {
                 "code": "",
                 "language": "unknown",
                 "model_kwargs": {
-                    "seed": random.randint(0, 100000),
+                    "seed": seed,
                 },
                 "metadata": {
                     "usage": {
@@ -212,97 +249,41 @@ int main() {
                 }
             }
 
-    async def generate_single(self, problem_id: str, subtask: Dict, i: int) -> Optional[Dict]:
-        """Generate a single response with semaphore control."""
-        try:
-            async with self._semaphore:
-                try:
-                    prompt = PROMPT.format(problem_statement=subtask.get('statement', ''))
-                except Exception as e:
-                    logger.error(f"Failed to format prompt for problem {problem_id}: {str(e)}")
-                    prompt = "Error: Failed to format prompt"
-                
-                try:
-                    result = await self.call_llm(prompt)
-                    result.update({
-                        "problem_id": problem_id,
-                        "subtask": subtask.get("subtask", "unknown"),
-                        "prompt": prompt,
-                    })
-                    
-                    # Log progress and token usage
-                    if result.get("metadata", {}).get("usage"):
-                        usage = result["metadata"]["usage"]
-                        logger.info(
-                            f"Generation {i+1}/{self.num_generations} for problem {problem_id} - "
-                            f"Tokens: {usage.get('total_tokens', 0)} "
-                            f"(prompt: {usage.get('prompt_tokens', 0)}, "
-                            f"completion: {usage.get('completion_tokens', 0)}) - "
-                            f"Cost: ${usage.get('cost', 0.0):.4f}"
-                        )
-                    return result
-                except Exception as e:
-                    logger.error(f"Failed to generate for problem {problem_id}, generation {i}: {str(e)}")
-                    return None
-        except Exception as e:
-            logger.error(f"Critical error in generate_single for problem {problem_id}: {str(e)}")
-            return None
-
     async def evaluate_problem(self, problem_id: str) -> List[Dict]:
-        """Evaluate a single problem with multiple generations in parallel."""
+        """Prepare result entries for a single problem."""
         subtasks = self.get_subtasks(problem_id)
         if not subtasks:
             logger.warning(f"No subtasks found for problem {problem_id}")
             return []
 
-        subtask = self.get_next_subtask(subtasks, 0)
-        if not subtask:
-            return []
+        results = []
+        for i in range(self.num_generations):
+            subtask = self.get_next_subtask(subtasks, i)
+            if not subtask:
+                return []
 
-        # Create tasks for all generations
-        tasks = [
-            self.generate_single(problem_id, subtask, i)
-            for i in range(self.num_generations)
-        ]
-        
-        # Run generations in parallel with controlled concurrency
-        results = await asyncio.gather(*tasks)
-        
-        # Filter out None results (failed generations)
-        return [r for r in results if r is not None]
+            try:
+                prompt = PROMPT.format(problem_statement=subtask.get('statement', ''))
+                results.append({
+                    "problem_id": problem_id,
+                    "subtask": subtask.get("subtask", "unknown"),
+                    "prompt": prompt,
+                    "generation": None,
+                    "code": "",
+                    "language": "unknown",
+                    "solution_number": i,
+                    "uuid": str(uuid.uuid4()),
+                    "model_kwargs": {"seed": i},
+                    "metadata": {
+                        "usage": {'completion_tokens': 0, 'prompt_tokens': 0, 'total_tokens': 0, 'cost': 0.0},
+                        "timestamp": datetime.now().isoformat()
+                    }
+                })
+            except Exception as e:
+                logger.error(f"Failed to prepare prompts for problem {problem_id}: {str(e)}")
+                return []
 
-    def push_to_hub(self, results: List[Dict]):
-        """Push the results to the Hugging Face Hub."""
-        try:
-            if not results:
-                logger.warning("No results to push to hub")
-                return
-                
-            logger.info("Converting results to Hugging Face dataset...")
-            
-            try:
-                # Convert to Dataset
-                hf_dataset = datasets.Dataset.from_list(results)
-            except Exception as e:
-                logger.error(f"Failed to convert results to dataset: {str(e)}")
-                return
-            
-            # Push to hub with dummy prefix if in dry-run mode
-            try:
-                model_name = f"dummy-{self.model_id}" if self.dry_run else self.model_id
-                repo_name = f"{self.org_id}/ioi-eval-{model_name.replace('/', '_')}"
-                logger.info(f"Pushing dataset to {repo_name}...")
-                
-                hf_dataset.push_to_hub(
-                    repo_name,
-                    private=False,
-                    commit_message=f"Add evaluation results for {model_name}"
-                )
-                logger.info(f"Successfully pushed dataset to {repo_name}")
-            except Exception as e:
-                logger.error(f"Failed to push to hub: {str(e)}")
-        except Exception as e:
-            logger.error(f"Critical error in push_to_hub: {str(e)}")
+        return results
 
     async def run_evaluation(self):
         """Run the evaluation for all problems."""
@@ -327,37 +308,83 @@ int main() {
                 problem_ids = problem_ids[:self.n_problems]
                 logger.info(f"Limited evaluation to first {self.n_problems} problems")
             
-            logger.info(f"Starting evaluation of {len(problem_ids)} problems with concurrency {self.concurrency}...")
+            logger.info(f"Starting evaluation of {len(problem_ids)} problems...")
 
+            # Create or load the complete pool of results
             all_results = []
-            async for problem_id in tqdm(problem_ids, desc="Evaluating problems"):
-                try:
+            if not self.override:
+                # Try to load previous results
+                previous_results = await self.load_previous_results()
+                if previous_results:
+                    all_results = previous_results
+                    logger.info(f"Loaded {len(all_results)} previous results")
+
+            if not all_results:
+                # Create fresh pool of results
+                logger.info("Creating fresh pool of results...")
+                for problem_id in tqdm(problem_ids, desc="Preparing results"):
                     results = await self.evaluate_problem(problem_id)
-                    if results:  # Only extend if we got valid results
-                        all_results.extend(results)
+                    all_results.extend(results)
+                logger.info(f"Created {len(all_results)} result entries")
 
-                    # Save intermediate results in model directory
+            # Count how many need to be generated
+            to_generate = [r for r in all_results if r.get("generation") is None]
+            logger.info(f"Need to generate {len(to_generate)} out of {len(all_results)} total entries")
+
+            if not to_generate:
+                logger.info("No generations needed - all results are already available")
+                return all_results
+
+            # Run generations for entries without results
+            async def process_single(result: Dict) -> Optional[Dict]:
+                seed = result["model_kwargs"]["seed"]
+                async with self._semaphore:
                     try:
-                        model_results_file = self.model_dir / f"{problem_id}_results.json"
-                        with open(model_results_file, "w") as f:
-                            json.dump(results, f, indent=2)
+                        llm_result = await self.call_llm(result["prompt"], result["model_kwargs"]["seed"])
+                        result.update({
+                            "generation": llm_result["generation"],
+                            "code": llm_result["code"],
+                            "language": llm_result["language"],
+                            "model_kwargs": llm_result["model_kwargs"],
+                            "metadata": llm_result["metadata"]
+                        })
+                        
+                        # Log progress and token usage
+                        if result["metadata"].get("usage"):
+                            usage = result["metadata"]["usage"]
+                            logger.info(
+                                f"Problem {result['problem_id']} (Solution {result['solution_number']}) - "
+                                f"Tokens: {usage.get('total_tokens', 0)} "
+                                f"(prompt: {usage.get('prompt_tokens', 0)}, "
+                                f"completion: {usage.get('completion_tokens', 0)}) - "
+                                f"Cost: ${usage.get('cost', 0.0):.4f}"
+                            )
+                        return result
                     except Exception as e:
-                        logger.error(f"Failed to save intermediate results for problem {problem_id}: {str(e)}")
-                except Exception as e:
-                    logger.error(f"Failed to evaluate problem {problem_id}: {str(e)}")
-                    continue
+                        logger.error(f"Failed generation for problem {result['problem_id']}: {str(e)}")
+                        return result
 
-            # Save complete dataset in organization directory
+            tasks = [
+                process_single(result) if result.get("generation") is None else result
+                for result in to_generate
+            ]
+            
+            # Run generations in parallel with controlled concurrency
+            generated_results = await tqdm.gather(*tasks, desc="Running generations")
+
+            all_result = Dataset.from_list(generated_results)
+            model_name = f"dummy-{self.model_id}" if self.dry_run else self.model_id
+            model_name = model_name.replace("/", "_")
+
+            # Save to disk first
             try:
-                dataset_file = self.org_dir / f"{self.model_id}_dataset.json"
-                with open(dataset_file, "w") as f:
-                    json.dump(all_results, f, indent=2)
-                logger.info(f"Results saved to {dataset_file}")
+                all_result.save_to_disk(self.org_dir / f"{model_name}")
             except Exception as e:
-                logger.error(f"Failed to save complete dataset: {str(e)}")
+                logger.error(f"Failed to save dataset: {str(e)}")
 
             # Log final statistics
-            logger.info(f"Evaluation completed. Total generations: {len(all_results)}")
+            successful = len([r for r in all_results if r.get("generation") is not None])
+            logger.info(f"Evaluation completed. Total successful generations: {successful}/{len(all_results)}")
             logger.info(
                 f"Total tokens used: {self.total_prompt_tokens + self.total_completion_tokens} "
                 f"(prompt: {self.total_prompt_tokens}, completion: {self.total_completion_tokens})"
@@ -366,7 +393,7 @@ int main() {
             
             # Push to Hugging Face Hub
             try:
-                self.push_to_hub(all_results)
+                all_result.push_to_hub(self.org_id, f"{model_name}")
             except Exception as e:
                 logger.error(f"Failed to push to hub: {str(e)}")
             
@@ -374,6 +401,7 @@ int main() {
         except Exception as e:
             logger.error(f"Critical error in run_evaluation: {str(e)}")
             return []
+
 
 def main():
     load_dotenv()  # Load environment variables from .env file
@@ -384,9 +412,10 @@ def main():
     parser.add_argument("--model_id", required=True, help="Model ID")
     parser.add_argument("--num_generations", type=int, default=50, help="Number of generations per problem")
     parser.add_argument("--num_retries", type=int, default=10, help="Number of retries for failed API calls")
-    parser.add_argument("--concurrency", type=int, default=5, help="Number of concurrent generations")
+    parser.add_argument("--concurrency", type=int, default=400, help="Number of concurrent generations")
     parser.add_argument("--n_problems", type=int, default=None, help="Number of problems to evaluate (None for all)")
     parser.add_argument("--dry_run", action="store_true", help="Run without making actual LLM calls")
+    parser.add_argument("--override", action="store_true", help="Override existing results and start fresh")
     args = parser.parse_args()
 
     evaluator = IOIEvaluator(
@@ -396,7 +425,8 @@ def main():
         num_retries=args.num_retries,
         concurrency=args.concurrency,
         n_problems=args.n_problems,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        override=args.override
     )
     asyncio.run(evaluator.run_evaluation())
 
