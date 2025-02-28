@@ -373,8 +373,9 @@ int main() {
             generated_results = await tqdm.gather(*tasks, desc="Running generations")
 
             all_result = Dataset.from_list(generated_results)
-            model_name = f"dummy-{self.model_id}" if self.dry_run else self.model_id
-            model_name = model_name.replace("/", "_")
+            model_name = f"ioi-eval-{self.model_id.replace('/', '_')}"
+            if self.dry_run:
+                model_name = f"dummy-{model_name}"
 
             # Save to disk first
             try:
@@ -393,7 +394,8 @@ int main() {
             
             # Push to Hugging Face Hub
             try:
-                all_result.push_to_hub(self.org_id, f"{model_name}")
+                all_result.push_to_hub(f"{self.org_id}/{model_name}")
+                logger.info(f"Pushed to hub: {self.org_id}/{model_name}")
             except Exception as e:
                 logger.error(f"Failed to push to hub: {str(e)}")
             
