@@ -42,3 +42,6 @@ ENV/
 *.log
 evaluation.log
 */ioi-leaderboard-*/  # Evaluation results directories 
+
+# logs
+logs/*

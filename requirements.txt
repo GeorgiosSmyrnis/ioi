@@ -1,7 +1,10 @@
-litellm>=1.30.3
-datasets>=2.18.0
-tqdm>=4.66.0
-python-dotenv>=1.0.0
-loguru>=0.7.2
-aiohttp>=3.9.3
-huggingface_hub>=0.20.3 
+litellm~=1.30.3
+datasets~=2.18.0
+tqdm~=4.66.0
+python-dotenv~=1.0.0
+loguru~=0.7.2
+aiohttp~=3.9.3
+huggingface_hub~=0.20.3 
+setuptools
+transformers==4.48.3
+polars
