@@ -1,6 +1,10 @@
 # Environment variables
+
+# logs
+logs/*
+
+# env
 .env
-.env.*
 
 # Python
 __pycache__/
@@ -42,6 +46,3 @@ ENV/
 *.log
 evaluation.log
 */ioi-leaderboard-*/  # Evaluation results directories 
-
-# logs
-logs/*
