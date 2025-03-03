@@ -28,7 +28,7 @@ class IOIEvaluator:
                  num_generations: int = 50, num_retries: int = 10, 
                  concurrency: int = 10, n_problems: Optional[int] = None, 
                  n_subtasks: Optional[int] = None, dry_run: bool = False,
-                 override: bool = False):
+                 override: bool = False, model_postfix: Optional[str] = None):
         self.org_id = org_id
         self.model_id = model_id
         self.api_base = api_base
@@ -51,6 +51,7 @@ class IOIEvaluator:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_cost = 0.0
+        self.model_postfix = model_postfix
         
         # Semaphore for controlling concurrency
         self._semaphore = asyncio.Semaphore(concurrency)
@@ -67,9 +68,7 @@ class IOIEvaluator:
             logger.info("Override mode enabled - not loading previous results")
             return None
             
-        # First try loading from HuggingFace Hub
-        model_name = f"dummy-{self.model_id}" if self.dry_run else self.model_id
-        repo_name = f"{self.org_id}/ioi-eval-{model_name.replace('/', '_')}"
+        repo_name = f"{self.org_id}/{self.get_model_name()}"
         
         try:
             logger.info(f"Attempting to load previous results from HuggingFace Hub: {repo_name}")
@@ -429,9 +428,7 @@ int main() {
                 
             # Convert to HF Dataset
             output_dataset = Dataset.from_polars(merged_df)
-            model_name = f"ioi-eval-{self.model_id.replace('/', '_')}"
-            if self.dry_run:
-                model_name = f"dummy-{model_name}"
+            model_name = self.get_model_name()
 
             # Save to disk first
             # try:
@@ -458,6 +455,17 @@ int main() {
         except Exception as e:
             raise e
 
+    
+    def get_model_name(self):
+        model_name = f"ioi-eval-{self.model_id.replace('/', '_')}"
+        if self.dry_run:
+            model_name = f"dummy-{model_name}"
+
+        if self.model_postfix:
+            model_name = f"{model_name}-{self.model_postfix}"
+
+        return model_name
+
 
 def main():
     load_dotenv()  # Load environment variables from .env file
@@ -474,6 +482,7 @@ def main():
     parser.add_argument("--n_subtasks", type=int, default=1, help="Number of subtasks to evaluate per problem (None for all)")
     parser.add_argument("--dry_run", action="store_true", help="Run without making actual LLM calls")
     parser.add_argument("--override", action="store_true", help="Override existing results and start fresh")
+    parser.add_argument("--model_postfix", help="Postfix for the model name")
     args = parser.parse_args()
 
     evaluator = IOIEvaluator(
@@ -486,7 +495,8 @@ def main():
         n_problems=args.n_problems,
         n_subtasks=args.n_subtasks,
         dry_run=args.dry_run,
-        override=args.override
+        override=args.override,
+        model_postfix=args.model_postfix
     )
     asyncio.run(evaluator.run_evaluation())
 
