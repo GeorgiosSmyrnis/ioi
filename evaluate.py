@@ -83,16 +83,16 @@ class IOIEvaluator:
     def load_ioi_dataset(self):
         """Load the IOI 2024 dataset from Huggingface."""
         logger.info("Loading IOI 2024 dataset...")
-        return load_dataset("open-r1/ioi-2024", split="train")
+        return load_dataset("open-r1/ioi-2024", split="train").to_polars()
     
     def get_subtasks(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
         """Get all subtasks for a given problem ID."""
-        subtasks = dataset.filter(pl.col("id") == problem_id).unique().to_dicts()
+        subtasks = dataset.filter(pl.col("id") == problem_id).select(pl.col("subtask", "statement")).unique().to_dicts()
         # If n_subtasks is set, limit the number of subtasks
         if self.n_subtasks is not None:
             # Sort subtasks by ID to ensure consistent selection
             subtasks = sorted(subtasks, key=lambda x: int(x["subtask"][:2]))
-            subtasks = subtasks[:-self.n_subtasks]
+            subtasks = subtasks[-self.n_subtasks:]
             
         return subtasks
 
@@ -212,10 +212,10 @@ int main() {
                 message_content = response.choices[0].message.content if response.choices else ""
             except Exception as e:
                 logger.error(f"Failed to extract message content: {str(e)}")
-                message_content = ""
+                message_content = None
             
             # Extract code from the response
-            code, language = self.extract_code(message_content)
+            code, language = self.extract_code(message_content or "")
             
             return {
                 "generation": message_content,
@@ -232,7 +232,7 @@ int main() {
         except Exception as e:
             logger.error(f"LLM call failed: {str(e)}")
             return {
-                "generation": "",
+                "generation": None,
                 "code": "",
                 "language": "unknown",
                 "model_kwargs": {
@@ -250,13 +250,13 @@ int main() {
                 }
             }
 
-    async def create_solution_requests(self, problem_id: str, dataset: Dataset) -> List[Dict]:
+    async def create_solution_requests(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
         """Prepare result entries for a single problem."""
         subtasks = self.get_subtasks(problem_id, dataset)
         if not subtasks:
             logger.warning(f"No subtasks found for problem {problem_id}")
             return []
-
+        
         results = []
         for subtask in subtasks:
             for i in range(self.num_generations):
@@ -292,7 +292,8 @@ int main() {
             dataset = self.load_ioi_dataset()
             # Get unique problem IDs
             try:
-                problem_ids = list(set(item["id"] for item in dataset))
+                # Extract unique problem IDs using polars
+                problem_ids = dataset.select(pl.col("id")).unique().to_series().to_list()
                 problem_ids.sort()
                 if self.n_problems is not None:
                     problem_ids = problem_ids[:self.n_problems]
@@ -314,17 +315,20 @@ int main() {
             logger.info(f"Created {len(requests_df)} solution requests")
 
             # Step 2: Load previous results
-            previous_df = pl.DataFrame()
+            previous_df = None
             if not self.override:
                 previous_df = await self.load_previous_results()
                 if previous_df is not None:
                     logger.info(f"Loaded {len(previous_df)} previous results")
             
+            
             # Step 3: Merge solution requests with previous results efficiently
             if previous_df is not None:
                 # Keep only the columns we want to preserve from previous results
-                preserve_cols = ['uuid', 'generation', 'code', 'language', 'metadata']
-                previous_df = previous_df.select(preserve_cols).filter(pl.col('uuid').is_not_null() & (pl.col('generation') != ""))
+                preserve_cols = ['generation', 'code', 'language', 'metadata', 'model_kwargs']
+
+                preserve_cols_with_key = preserve_cols + ['problem_id', 'subtask', 'solution_number']
+                previous_df = previous_df.select(preserve_cols_with_key).filter(pl.col('generation').is_not_null() & (pl.col('generation') != ""))
                 
                 # Merge using polars, keeping all solution requests and only matching previous results
                 merged_df = requests_df.join(
@@ -335,7 +339,7 @@ int main() {
                 )
 
                 # Update values from previous results where they exist
-                for col in ['generation', 'code', 'language', 'metadata']:
+                for col in preserve_cols:
                     prev_col = f'{col}_prev'
                     merged_df = merged_df.with_columns(
                         pl.when(pl.col(prev_col).is_not_null())
