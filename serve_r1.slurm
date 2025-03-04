@@ -2,7 +2,7 @@
 #SBATCH --job-name=r1-server
 #SBATCH --partition=hopper-prod
 #SBATCH --qos=normal
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --output=./logs/%x_%j_%n.out
@@ -29,12 +29,13 @@ EVAL_SCRIPT_PATH="/fsx/hynek_kydlicek/projects/ioi-leaderboard/evaluate.py"
 EVAL_ARGS=""
 TP=16
 
-while getopts "m:a:t:h" opt; do
+while getopts "m:a:t:c:h" opt; do
     case $opt in
         m) MODEL_PATH="$OPTARG" ;;
         a) EVAL_ARGS="$OPTARG" ;;
         t) TP="$OPTARG" ;;
-        h|?) echo "Usage: sbatch $0 [-m MODEL_PATH] [-e CONDA_ENV] [-r ROUTER_ADDRESS] [-a EVAL_ARGS] [-t TP]"; exit 1 ;;
+        c) CONCURRENCY="$OPTARG" ;;
+        h|?) echo "Usage: sbatch $0 [-m MODEL_PATH] [-e CONDA_ENV] [-r ROUTER_ADDRESS] [-a EVAL_ARGS] [-t TP] [-c CONCURRENCY]"; exit 1 ;;
     esac
 done
 
@@ -46,6 +47,11 @@ fi
 
 if [ -z $MODEL_PATH ]; then
     echo "Error: Model path (-m MODEL_PATH) is required"
+    exit 1
+fi
+
+if [ -z $CONCURRENCY ]; then
+    echo "Error: Concurrency (-c CONCURRENCY) is required"
     exit 1
 fi
 
@@ -67,17 +73,17 @@ FIRST_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$FIRST_NODE" hostname --ip-address
 
 # Launch servers synchronously across all nodes
 # (--max-running-requests=56 is rough estimate to avoid too many evicted/preempted 16k-long requests)
-srun --nodes=2 --ntasks=2 --ntasks-per-node=1 \
+srun --nodes=1 --ntasks=1 --ntasks-per-node=1 \
     bash -c "python -m sglang.launch_server \
         --model-path '$MODEL_PATH' \
         --tp $TP \
         --dist-init-addr '$FIRST_NODE_IP:$DIST_PORT' \
-        --nnodes 2 \
+        --nnodes 1 \
         --node-rank \$SLURM_PROCID \
         --port '$SERVER_PORT' \
         --host 0.0.0.0 \
         --trust-remote-code \
-        --max-running-requests 56 \
+        --max-running-requests $CONCURRENCY \
         --context-length $CONTEXT_LENGTH" &
 
 # Wait for server with timeout
@@ -128,6 +134,7 @@ if [ -f "$EVAL_SCRIPT_PATH" ]; then
     python "$EVAL_SCRIPT_PATH" \
         --model_id "sglang/$MODEL_PATH" \
         --api_base "http://localhost:$SERVER_PORT/v1" \
+        --concurrency $CONCURRENCY \
         $EVAL_ARGS
 else
     echo "Warning: Evaluation script not found at $EVAL_SCRIPT_PATH"

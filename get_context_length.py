@@ -22,7 +22,9 @@ def get_context_length(model_name: str) -> int:
             # If sliding window is disabled, use max_position_embeddings instead
             context_length = getattr(config, 'max_position_embeddings', context_length)
             
-        return context_length
+
+        # Cap to 32k
+        return min(context_length, 32768)
     except Exception as e:
         logger.warning(f"Could not get context length from config for {model_name}: {e}")
         return 4096  # Default fallback

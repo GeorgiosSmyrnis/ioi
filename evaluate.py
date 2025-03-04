@@ -16,18 +16,27 @@ from huggingface_hub import HfApi
 import polars as pl
 
 PROMPT = """\
-You are an expert competitive programmer. You will be given a problem statement, test case constraints and example test inputs and outputs. Please reason step by step about the solution, then provide a complete implementation in C++17. Your solution must read input from standard input (cin), and write output to standard output (cout). Do not include any debug prints or additional output. Your solution will have 2 seconds execution time to solve each test case.
+You are an expert competitive programmer. You will be given a problem statement, test case constraints and example test inputs and outputs. Please reason step by step about the solution, then provide a complete implementation in C++17. You should correctly implement the routine(s) described in Implementation Details, without reading or writing anything directly from stdin or to stdout, as input and output are passed through the implemented routines. Assume your code will be run on the OFFICIAL grader, and do not add a main, a sample grader, or any other functionality unless it has been explicitly requested.
 Put your final solution within a single code block: ```cpp\n<your code here>``` 
 
-Problem statement:
-{problem_statement}\
+# Problem statement ({problem_name})
+{problem_statement}
+
+## Time limit
+Your solution will have {time_limit} second(s) execution time to solve each test case.
+
+# Starting code
+Here's your starting code with some skeleton/placeholder functionality:
+```cpp
+{skeleton}
+```\
 """
 
 class IOIEvaluator:
     def __init__(self, org_id: str, model_id: str, api_base: Optional[str] = None, 
                  num_generations: int = 50, num_retries: int = 10, 
-                 concurrency: int = 10, n_problems: Optional[int] = None, 
-                 n_subtasks: Optional[int] = None, dry_run: bool = False,
+                 concurrency: int = 10, num_problems: Optional[int] = None, 
+                 num_subtasks: Optional[int] = None, dry_run: bool = False,
                  override: bool = False, model_postfix: Optional[str] = None):
         self.org_id = org_id
         self.model_id = model_id
@@ -35,8 +44,8 @@ class IOIEvaluator:
         self.num_generations = num_generations
         self.num_retries = num_retries
         self.concurrency = concurrency
-        self.n_problems = n_problems
-        self.n_subtasks = n_subtasks
+        self.num_problems = num_problems
+        self.num_subtasks = num_subtasks
         self.dry_run = dry_run
         self.override = override
         self.previous_results = None
@@ -86,12 +95,12 @@ class IOIEvaluator:
     
     def get_subtasks(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
         """Get all subtasks for a given problem ID."""
-        subtasks = dataset.filter(pl.col("id") == problem_id).select(pl.col("subtask", "statement")).unique().to_dicts()
+        subtasks = dataset.filter(pl.col("id") == problem_id).select(pl.col("subtask", "statement", "time_limit", "starting_code")).unique().to_dicts()
         # If n_subtasks is set, limit the number of subtasks
-        if self.n_subtasks is not None:
+        if self.num_subtasks is not None and self.num_subtasks > 0:
             # Sort subtasks by ID to ensure consistent selection
             subtasks = sorted(subtasks, key=lambda x: int(x["subtask"][:2]))
-            subtasks = subtasks[-self.n_subtasks:]
+            subtasks = subtasks[-self.num_subtasks:]
             
         return subtasks
 
@@ -135,14 +144,10 @@ int main() {
     def extract_code(self, text: str) -> tuple[str, str]:
         """Extract code from the response between ```cpp and ``` markers."""
         try:
-            if not text:
-                logger.warning("Empty text provided to extract_code")
-                return "", "unknown"
-                
-            code_pattern = r"```cpp\n(.*?)```"
-            match = re.search(code_pattern, text, re.DOTALL)
-            if match:
-                code = match.group(1).strip()
+            parts = text.split("```cpp\n")
+            if len(parts) > 1:
+                code_block = parts[-1].split("```")[0]
+                code = code_block.strip()
                 if not code:
                     logger.warning("Empty code block found")
                     return "", "cpp"
@@ -165,6 +170,8 @@ int main() {
                 model_name = model_name.replace("sglang/", "openai/")
                 kwargs["api_base"] = self.api_base
                 kwargs["api_key"] = "sk-proj-1234567890"
+                kwargs["top_k"] = 20
+
             
 
             response = await litellm.acompletion(
@@ -172,6 +179,8 @@ int main() {
                 messages=[{"role": "user", "content": prompt, "cache_control": {"type": "ephemeral"}}],
                 seed=seed,
                 num_retries=self.num_retries,
+                top_p=0.8,
+                temperature=0.7,
                 **kwargs
             )
             
@@ -215,7 +224,6 @@ int main() {
             
             # Extract code from the response
             code, language = self.extract_code(message_content or "")
-            
             return {
                 "generation": message_content,
                 "code": code,
@@ -249,6 +257,20 @@ int main() {
                 }
             }
 
+    def prepare_prompt(self, task: dict) -> str:
+        statement = task['statement']
+        task_name, statement = statement.split("\n\n", maxsplit=1)
+        task_name = task_name.lstrip("# ")
+        time_limit = task['time_limit']
+        skeleton = task['starting_code'].strip()
+
+        return PROMPT.format(
+            problem_name=task_name,
+            problem_statement=statement,
+            time_limit=time_limit,
+            skeleton=skeleton
+        )
+
     async def create_solution_requests(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
         """Prepare result entries for a single problem."""
         subtasks = self.get_subtasks(problem_id, dataset)
@@ -258,10 +280,9 @@ int main() {
         
         results = []
         for subtask in subtasks:
+            prompt = self.prepare_prompt(subtask)
             for i in range(self.num_generations):
                 try:
-                    prompt = PROMPT.format(problem_statement=subtask.get('statement', ''))
-                    # Generate deterministic UUID based on problem_id and solution number
                     random_uuid = str(uuid.uuid4())
                     
                     results.append({
@@ -294,9 +315,9 @@ int main() {
                 # Extract unique problem IDs using polars
                 problem_ids = dataset.select(pl.col("id")).unique().to_series().to_list()
                 problem_ids.sort()
-                if self.n_problems is not None:
-                    problem_ids = problem_ids[:self.n_problems]
-                    logger.info(f"Limited evaluation to first {self.n_problems} problems")
+                if self.num_problems is not None:
+                    problem_ids = problem_ids[:self.num_problems]
+                    logger.info(f"Limited evaluation to first {self.num_problems} problems")
             except Exception as e:
                 logger.error(f"Failed to extract problem IDs: {str(e)}")
                 return []
@@ -414,12 +435,13 @@ int main() {
             )
 
             # Update the old columns with the new values
-            merged_df = merged_df.with_columns(
-                pl.when(pl.col('generation_gen').is_not_null() & (pl.col('generation_gen') != ""))
-                .then(pl.col('generation_gen'))
-                .otherwise(pl.col('generation'))
-                .alias('generation')
-            )
+            for col in ['generation', 'code', 'language', 'metadata', 'model_kwargs']:
+                merged_df = merged_df.with_columns(
+                    pl.when(pl.col(f'generation_gen').is_not_null() & (pl.col(f'generation_gen') != ""))
+                    .then(pl.col(f'{col}_gen'))
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
 
             # Drop the _gen columns
             merged_df = merged_df.select([
@@ -478,8 +500,8 @@ def main():
     parser.add_argument("--num_generations", type=int, default=50, help="Number of generations per problem")
     parser.add_argument("--num_retries", type=int, default=10, help="Number of retries for failed API calls")
     parser.add_argument("--concurrency", type=int, default=400, help="Number of concurrent generations")
-    parser.add_argument("--n_problems", type=int, default=None, help="Number of problems to evaluate (None for all)")
-    parser.add_argument("--n_subtasks", type=int, default=1, help="Number of subtasks to evaluate per problem (None for all)")
+    parser.add_argument("--num_problems", type=int, default=None, help="Number of problems to evaluate (None for all)")
+    parser.add_argument("--num_subtasks", type=int, default=1, help="Number of subtasks to evaluate per problem (None for all)")
     parser.add_argument("--dry_run", action="store_true", help="Run without making actual LLM calls")
     parser.add_argument("--override", action="store_true", help="Override existing results and start fresh")
     parser.add_argument("--model_postfix", help="Postfix for the model name")
@@ -492,8 +514,8 @@ def main():
         num_generations=args.num_generations,
         num_retries=args.num_retries,
         concurrency=args.concurrency,
-        n_problems=args.n_problems,
-        n_subtasks=args.n_subtasks,
+        num_problems=args.num_problems,
+        num_subtasks=args.num_subtasks,
         dry_run=args.dry_run,
         override=args.override,
         model_postfix=args.model_postfix
