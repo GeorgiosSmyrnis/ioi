@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import random
 from datetime import datetime
 import re
@@ -14,6 +14,9 @@ import litellm
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 import polars as pl
+import aiofiles
+from aiofiles.threadpool.text import AsyncTextIOWrapper
+from litellm.utils import ModelResponse, Message, Usage, Choices
 
 PROMPT = """\
 You are an expert competitive programmer. You will be given a problem statement, test case constraints and example test inputs and outputs. Please reason step by step about the solution, then provide a complete implementation in C++17. You should correctly implement the routine(s) described in Implementation Details, without reading or writing anything directly from stdin or to stdout, as input and output are passed through the implemented routines. Assume your code will be run on the OFFICIAL grader, and do not add a main, a sample grader, or any other functionality unless it has been explicitly requested.
@@ -23,7 +26,7 @@ Put your final solution within a single code block: ```cpp\n<your code here>```
 {problem_statement}
 
 ## Time limit
-Your solution will have {time_limit} second(s) execution time to solve each test case.
+Your solution will have {time_limit} second(s) execution time and {memory_limit}MB memory limit to solve each test case.
 
 # Starting code
 Here's your starting code with some skeleton/placeholder functionality:
@@ -37,7 +40,9 @@ class IOIEvaluator:
                  num_generations: int = 50, num_retries: int = 10, 
                  concurrency: int = 10, num_problems: Optional[int] = None, 
                  num_subtasks: Optional[int] = None, dry_run: bool = False,
-                 override: bool = False, model_postfix: Optional[str] = None):
+                 override: bool = False, model_postfix: Optional[str] = None,
+                 revision: Optional[str] = None, timeout: Optional[int] = 600,
+                 use_requests: bool = False, max_tokens: Optional[int] = None):
         self.org_id = org_id
         self.model_id = model_id
         self.api_base = api_base
@@ -48,13 +53,11 @@ class IOIEvaluator:
         self.num_subtasks = num_subtasks
         self.dry_run = dry_run
         self.override = override
-        self.previous_results = None
-        
+        self.revision = revision
         # Create organization and model directories
-        self.org_dir = Path(org_id)
-        self.model_dir = self.org_dir / model_id
-        self.org_dir.mkdir(parents=True, exist_ok=True)
-        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.timeout = timeout
+        self.use_litellm = not use_requests
+        self.max_tokens = max_tokens
         
         # Tracking totals
         self.total_prompt_tokens = 0
@@ -64,38 +67,147 @@ class IOIEvaluator:
         
         # Semaphore for controlling concurrency
         self._semaphore = asyncio.Semaphore(concurrency)
+        
+        # HTTP session for direct API calls when not using litellm
+        self._session = None
 
         if self.api_base:
             logger.info(f"Using API base: {self.api_base}")
+            
+        if not self.use_litellm:
+            logger.info("Using direct asyncio requests instead of LiteLLM")
 
         if dry_run:
             logger.warning("Running in dry-run mode - no actual LLM calls will be made")
 
+        # Create results directory
+        self.model_dir = Path("results") / self.get_model_name()
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # File path for the single JSONL file
+        self.results_file = self.model_dir / "results.jsonl"
+        
+        # Lock for file access
+        self._file_lock = asyncio.Lock()
+
+    async def save_result_locally(self, result: Dict, problem_id: str, subtask: str, solution_number: int):
+        """Save a single result to local JSONL storage with locking."""
+        # Ensure problem_id is included in the result
+        result['problem_id'] = problem_id
+        result['subtask'] = subtask
+        result['solution_number'] = solution_number
+        
+        try:
+            # Use lock to prevent concurrent writes
+            async with self._file_lock:
+                async with aiofiles.open(self.results_file, 'a') as f:
+                    await f.write(json.dumps(result) + '\n')
+        except Exception as e:
+            logger.error(f"Failed to save result locally: {str(e)}")
+
     async def load_previous_results(self) -> Optional[pl.DataFrame]:
-        """Load previous results from HuggingFace Hub or local files."""
+        """Load previous results from both HuggingFace Hub and local JSONL storage."""
         if self.override:
             logger.info("Override mode enabled - not loading previous results")
             return None
-            
-        repo_name = f"{self.org_id}/{self.get_model_name()}"
         
+        results_dfs = []
+        
+        # Try loading from Hub
+        repo_name = f"{self.org_id}/{self.get_model_name()}"
         try:
             logger.info(f"Attempting to load previous results from HuggingFace Hub: {repo_name}")
             dataset = load_dataset(repo_name, split="train")
-            logger.info(f"Loaded previous results from HuggingFace Hub: {len(dataset)} entries")
-            return dataset.to_polars()
+            if dataset is not None:
+                # Convert to pandas then to polars
+                df = dataset.to_polars()
+
+                # Add a column indicating if the result is local
+                df = df.with_columns([
+                    pl.lit(False).alias('is_local')
+                ])
+                results_dfs.append(df)
+
+                logger.info(f"Loaded {len(df)} previous results from HuggingFace Hub")
         except Exception as e:
             logger.info(f"Could not load from HuggingFace Hub: {str(e)}")
+
+        # Try loading from local storage
+        try:
+            if self.results_file.exists():
+                results = []
+                async with self._file_lock:
+                    async with aiofiles.open(self.results_file, 'r') as f:
+                        async for line in f:
+                            try:
+                                result = json.loads(line.strip())
+                                results.append(result)
+                            except Exception as e:
+                                logger.error(f"Failed to parse JSONL line: {str(e)}")
             
+                if results:
+                    local_df = pl.DataFrame(results).with_columns([
+                        pl.lit(True).alias('is_local')
+                    ])
+                    results_dfs.append(local_df)
+                    logger.info(f"Loaded {len(local_df)} previous results from local storage")
+        except Exception as e:
+            logger.error(f"Failed to load from local storage: {str(e)}")
+
+        # Combine results if we have any
+        if results_dfs:
+            # Select just columns: 'generation', 'code', 'language', 'model_kwargs', 'metadata', 'uuid', 'problem_id', 'subtask', 'solution_number', 'is_local'
+            common_columns = ['generation', 'code', 'language', 'model_kwargs', 'metadata', 'uuid', 'problem_id', 'subtask', 'solution_number', 'is_local']
+
+            # Drop that are not in common_columns
+            results_dfs = [df.select(common_columns) for df in results_dfs]
+
+            # Try this instead:
+            # Add stop_reason to metadata if it doesn't exist
+            results_dfs = [df.with_columns(pl.when(pl.col('metadata').is_not_null()).then(pl.col('metadata').map_elements(lambda x: {"stop_reason": "unknown"} | x)).otherwise(pl.col('metadata')).alias('metadata')) for df in results_dfs]
+            
+            # Concatenate the aligned dataframes
+            combined_df = pl.concat(results_dfs, how="vertical")
+            
+            # First sort by whether code exists (True first), then by source (local first)
+            # This ensures we keep entries with code when deduplicating
+            deduplicated_df = (
+                combined_df
+                .with_columns([
+                    # Add a column indicating if code exists and is non-empty
+                    pl.when((pl.col('code').is_not_null()) & (pl.col('code') != ""))
+                    .then(1)
+                    .otherwise(0)
+                    .alias('has_code'),
+                ])
+                # Sort by has_code (descending) and is_local (descending)
+                .sort(['has_code', 'is_local'], descending=[True, True])
+                # Keep first occurrence after sorting (prioritizing entries with code and local source)
+                .unique(
+                    subset=["problem_id", "subtask", "solution_number"],
+                    keep='first'
+                )
+                # Drop the temporary columns
+                .drop(['has_code', 'is_local'])
+            )
+            
+            logger.info(f"Combined and deduplicated results: {len(deduplicated_df)} entries")
+            return deduplicated_df
+        
+        return None
 
     def load_ioi_dataset(self):
         """Load the IOI 2024 dataset from Huggingface."""
         logger.info("Loading IOI 2024 dataset...")
-        return load_dataset("open-r1/ioi-2024", split="train").to_polars()
+        dataset = load_dataset("open-r1/ioi-2024", split="train")
+        if isinstance(dataset, dict):
+            # Handle DatasetDict case
+            dataset = dataset['train']
+        return dataset.to_polars()
     
     def get_subtasks(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
         """Get all subtasks for a given problem ID."""
-        subtasks = dataset.filter(pl.col("id") == problem_id).select(pl.col("subtask", "statement", "time_limit", "starting_code")).unique().to_dicts()
+        subtasks = dataset.filter(pl.col("id") == problem_id).select(pl.col("subtask", "statement", "time_limit", "starting_code", "memory_limit")).unique().to_dicts()
         # If n_subtasks is set, limit the number of subtasks
         if self.num_subtasks is not None and self.num_subtasks > 0:
             # Sort subtasks by ID to ensure consistent selection
@@ -137,7 +249,8 @@ int main() {
                     'total_tokens': len(prompt.split()) + 10,
                     'cost': 0.0
                 },
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "stop_reason": "length"  # Add stop reason for dummy response
             }
         }
 
@@ -158,104 +271,164 @@ int main() {
             logger.error(f"Failed to extract code: {str(e)}")
             return "", "unknown"
 
-    async def call_llm(self, prompt: str, seed: int) -> Dict:
-        """Call the LLM using LiteLLM's built-in retry mechanism."""
-        try:
-            if self.dry_run:
-                return self.get_dummy_response(prompt, seed)
-
-            model_name = self.model_id
-            kwargs = {}
-            if self.model_id.startswith("sglang/"):
-                model_name = model_name.replace("sglang/", "openai/")
-                kwargs["api_base"] = self.api_base
-                kwargs["api_key"] = "sk-proj-1234567890"
-                kwargs["top_k"] = 20
-
-            
-
-            response = await litellm.acompletion(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt, "cache_control": {"type": "ephemeral"}}],
-                seed=seed,
-                num_retries=self.num_retries,
-                top_p=0.8,
-                temperature=0.7,
-                **kwargs
-            )
-            
-            # Extract usage information safely
-            usage = {}
-            cost = 0.0
-            if hasattr(response, 'usage'):
-                try:
-                    completion_tokens = getattr(response.usage, 'completion_tokens', 0)
-                    prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
-                    total_tokens = getattr(response.usage, 'total_tokens', 0)
+    async def generate_completion(self, prompt: str, seed: int) -> Dict:
+        """Generate completion using direct asyncio HTTP requests."""
+        retry_budget = self.num_retries
+        
+        while retry_budget > 0:
+            try:
+                await asyncio.sleep(random.uniform(0.0, 0.1))
+                async with self._session.post(
+                    f"{self.api_base}/v1/chat/completions",
+                    json={
+                        "model": "default",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "seed": seed,
+                        "temperature": 0.7,
+                        "top_p": 0.8,
+                        "max_tokens": self.max_tokens,
+                    },
+                    headers={"Authorization": "Bearer EMPTY"},
+                ) as response:
+                    result = await response.json(content_type=None)
                     
-                    # Calculate cost using litellm
-                    try:
-                        cost = litellm.completion_cost(completion_response=response)
-                    except Exception as e:
-                        logger.error(f"Failed to calculate cost: {str(e)}")
-                        cost = 0.0
+                    if result is None:
+                        logger.error("Received None response from API")
+                        retry_budget -= 1
+                        await asyncio.sleep(5)
+                        continue
                     
-                    usage = {
-                        'completion_tokens': completion_tokens,
-                        'prompt_tokens': prompt_tokens,
-                        'total_tokens': total_tokens,
-                        'cost': cost
-                    }
+                    # Extract response content
+                    message_content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    
+                    # Extract token usage
+                    usage = result.get("usage", {})
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    total_tokens = usage.get("total_tokens", 0)
                     
                     # Update totals
                     self.total_prompt_tokens += prompt_tokens
                     self.total_completion_tokens += completion_tokens
-                    self.total_cost += cost
                     
-                except Exception as e:
-                    logger.error(f"Failed to extract usage information: {str(e)}")
-            
-            # Extract message content safely
-            try:
-                message_content = response.choices[0].message.content if response.choices else ""
+                    # Extract code
+                    code, language = self.extract_code(message_content)
+                    
+                    response_dict = {
+                        "generation": message_content,
+                        "code": code,
+                        "language": language,
+                        "model_kwargs": {
+                            "seed": seed,
+                        },
+                        "metadata": {
+                            "usage": {
+                                'completion_tokens': completion_tokens,
+                                'prompt_tokens': prompt_tokens,
+                                'total_tokens': total_tokens,
+                            },
+                            "timestamp": datetime.now().isoformat(),
+                            "stop_reason": result.get("choices", [{}])[0].get("finish_reason", "unknown")
+                        }
+                    }
+                    
+                    
+                    return response_dict
+                    
             except Exception as e:
-                logger.error(f"Failed to extract message content: {str(e)}")
-                message_content = None
+                logger.exception(f"API error (will retry): {e}")
+                retry_budget -= 1
+                await asyncio.sleep(10)
+
+        raise Exception("All retries failed for direct API call")
+                
+
+    async def call_llm(self, prompt: str, seed: int, problem_id: str, subtask: str, solution_number: int) -> Dict:
+        """Call the LLM using LiteLLM's built-in retry mechanism or direct asyncio requests."""
+        if self.dry_run:
+            result = self.get_dummy_response(prompt, seed)
+            return result
             
-            # Extract code from the response
-            code, language = self.extract_code(message_content or "")
-            return {
-                "generation": message_content,
-                "code": code,
-                "language": language,
-                "model_kwargs": {
-                    "seed": seed,
-                },
-                "metadata": {
-                    "usage": usage,
-                    "timestamp": datetime.now().isoformat()
+        if not self.use_litellm:
+            return await self.generate_completion(prompt, seed)
+
+        return await self.call_litellm(prompt, seed)
+
+    async def call_litellm(self, prompt: str, seed: int) -> Dict:
+        model_name = self.model_id
+        kwargs = {}
+        if self.model_id.startswith("sglang/"):
+            model_name = model_name.replace("sglang/", "custom_openai/")
+            kwargs["api_base"] = self.api_base
+            kwargs["api_key"] = "sk-proj-1234567890"
+
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+
+        response: ModelResponse = await litellm.acompletion(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt, "cache_control": {"type": "ephemeral"}}],
+            seed=seed,
+            num_retries=self.num_retries,
+            top_p=0.8,
+            temperature=0.7,
+            timeout=self.timeout,
+            **kwargs
+        )
+
+        # Extract stop reason
+        stop_reason = response.choices[0].finish_reason
+        
+        # Extract usage information safely
+        usage = {}
+        cost = 0.0
+        if hasattr(response, 'usage'):
+            try:
+                completion_tokens = getattr(response.usage, 'completion_tokens', 0)
+                prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
+                total_tokens = getattr(response.usage, 'total_tokens', 0)
+                
+                # Calculate cost using litellm
+                try:
+                    cost = litellm.completion_cost(completion_response=response)
+                except Exception as e:
+                    logger.warning(f"Failed to calculate cost: {str(e)}")
+                    cost = 0.0
+                
+                usage = {
+                    'completion_tokens': completion_tokens,
+                    'prompt_tokens': prompt_tokens,
+                    'total_tokens': total_tokens,
+                    'cost': cost
                 }
+                
+                # Update totals
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
+                self.total_cost += cost
+                
+            except Exception as e:
+                logger.error(f"Failed to extract usage information: {str(e)}")
+        
+        message_content = response.choices[0].message.content if response.choices else ""
+        
+        # Extract code from the response
+        code, language = self.extract_code(message_content or "")
+        
+        result = {
+            "generation": message_content,
+            "code": code,
+            "language": language,
+            "model_kwargs": {
+                "seed": seed,
+            },
+            "metadata": {
+                "usage": usage,
+                "timestamp": datetime.now().isoformat(),
+                "stop_reason": stop_reason
             }
-        except Exception as e:
-            logger.error(f"LLM call failed: {str(e)}")
-            return {
-                "generation": None,
-                "code": "",
-                "language": "unknown",
-                "model_kwargs": {
-                    "seed": seed,
-                },
-                "metadata": {
-                    "usage": {
-                        'completion_tokens': 0,
-                        'prompt_tokens': 0,
-                        'total_tokens': 0,
-                        'cost': 0.0
-                    },
-                    "timestamp": datetime.now().isoformat(),
-                    "error": str(e)
-                }
-            }
+        }
+        return result
 
     def prepare_prompt(self, task: dict) -> str:
         statement = task['statement']
@@ -263,11 +436,13 @@ int main() {
         task_name = task_name.lstrip("# ")
         time_limit = task['time_limit']
         skeleton = task['starting_code'].strip()
+        memory_limit = int(task['memory_limit']/1024/1024)
 
         return PROMPT.format(
             problem_name=task_name,
             problem_statement=statement,
             time_limit=time_limit,
+            memory_limit=memory_limit,
             skeleton=skeleton
         )
 
@@ -309,11 +484,16 @@ int main() {
     async def run_evaluation(self):
         """Run the evaluation for all problems."""
         try:
-            dataset = self.load_ioi_dataset()
+            # Create HTTP session if using direct API calls
+            if not self.use_litellm and not self.dry_run:
+                import aiohttp
+                self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout), connector=aiohttp.TCPConnector(limit=self.concurrency, ttl_dns_cache=300, keepalive_timeout=self.timeout))
+                
+            ioi_dataset = self.load_ioi_dataset()
             # Get unique problem IDs
             try:
                 # Extract unique problem IDs using polars
-                problem_ids = dataset.select(pl.col("id")).unique().to_series().to_list()
+                problem_ids = ioi_dataset.select(pl.col("id")).unique().to_series().to_list()
                 problem_ids.sort()
                 if self.num_problems is not None:
                     problem_ids = problem_ids[:self.num_problems]
@@ -327,7 +507,7 @@ int main() {
             # Step 1: Generate all solution requests
             all_solution_requests = []
             for problem_id in tqdm(problem_ids, desc="Preparing solution requests"):
-                request = await self.create_solution_requests(problem_id, dataset)
+                request = await self.create_solution_requests(problem_id, ioi_dataset)
                 all_solution_requests.extend(request)
             
             # Convert to Polars DataFrame for efficient operations
@@ -380,6 +560,9 @@ int main() {
                 (pl.col('generation').is_null()) | 
                 (pl.col('generation') == "")
             )
+
+            # Update seeds ensuring uniqueness
+            to_generate_dicts = to_generate_df.to_dicts()
             logger.info(f"Need to generate {len(to_generate_df)} out of {len(merged_df)} total entries")
 
             if len(to_generate_df) == 0:
@@ -390,7 +573,13 @@ int main() {
             async def process_single(row: Dict) -> Dict:
                 async with self._semaphore:
                     try:
-                        llm_result = await self.call_llm(row["prompt"], row["model_kwargs"]["seed"])
+                        llm_result = await self.call_llm(
+                            row["prompt"], 
+                            row["model_kwargs"]["seed"],
+                            row["problem_id"],
+                            row["subtask"],
+                            row["solution_number"]
+                        )
                         
                         # Log progress and token usage
                         if llm_result["metadata"].get("usage"):
@@ -402,24 +591,30 @@ int main() {
                                 f"completion: {usage.get('completion_tokens', 0)}) - "
                                 f"Cost: ${usage.get('cost', 0.0):.4f}"
                             )
+                        
                         llm_result["uuid"] = row["uuid"]
+
+                        # Save result immediately
+                        await self.save_result_locally(llm_result, row["problem_id"], row["subtask"], row["solution_number"])
+
                         return llm_result
                     except Exception as e:
                         logger.error(f"Failed generation for problem {row['problem_id']}: {str(e)}")
-                        return {
-                            "generation": None,
+                        error_result = {
+                            "generation": "",
                             "code": "",
                             "language": "unknown",
                             "uuid": row["uuid"],
                             "metadata": {
                                 "error": str(e),
                                 "usage": {'completion_tokens': 0, 'prompt_tokens': 0, 'total_tokens': 0, 'cost': 0.0},
-                                "timestamp": datetime.now().isoformat()
+                                "timestamp": datetime.now().isoformat(),
+                                "stop_reason": "error"  # Add stop reason for error case
                             }
                         }
+                        return error_result
 
             # Run generations in parallel with controlled concurrency
-            to_generate_dicts = to_generate_df.to_dicts()
             tasks = [process_single(row) for row in to_generate_dicts]
             generated_results = await tqdm.gather(*tasks, desc="Running generations")
 
@@ -448,15 +643,33 @@ int main() {
                 c for c in merged_df.columns if not c.endswith('_gen')
             ])
                 
-            # Convert to HF Dataset
-            output_dataset = Dataset.from_polars(merged_df)
-            model_name = self.get_model_name()
+            # Validate results before pushing to hub
+            valid_results = merged_df.filter(
+                (pl.col('generation').is_not_null()) & 
+                (pl.col('generation') != "")
+            )
 
-            # Save to disk first
-            # try:
-            #     output_dataset.save_to_disk(f"ioi-leaderboard/{self.org_dir}_{model_name}")
-            # except Exception as e:
-            #     logger.error(f"Failed to save dataset: {str(e)}")
+            total_expected = len(merged_df)
+            total_valid = len(valid_results)
+
+            logger.info(f"Valid results: {total_valid}/{total_expected}")
+
+            # Only push to hub if all results are valid
+            if total_valid == total_expected:
+                # Convert to HF Dataset
+                output_dataset = Dataset.from_polars(merged_df)
+                model_name = self.get_model_name()
+                
+                try:
+                    output_dataset.push_to_hub(f"{self.org_id}/{model_name}")
+                    logger.info(f"Pushed to hub: {self.org_id}/{model_name}")
+                except Exception as e:
+                    logger.error(f"Failed to push to hub: {str(e)}")
+            else:
+                logger.warning(
+                    f"Not pushing to hub - missing {total_expected - total_valid} valid results. "
+                    "Results saved locally and can be retried later."
+                )
 
             # Log final statistics
             # logger.info(f"Evaluation completed. Total successful generations: {successful}/{len(all_results)}")
@@ -466,15 +679,17 @@ int main() {
             )
             logger.info(f"Total cost: ${self.total_cost:.4f}")
             
-            # Push to Hugging Face Hub
-            try:
-                output_dataset.push_to_hub(f"{self.org_id}/{model_name}")
-                logger.info(f"Pushed to hub: {self.org_id}/{model_name}")
-            except Exception as e:
-                logger.error(f"Failed to push to hub: {str(e)}")
-            
-            return output_dataset
+            # Clean up HTTP session if using direct API calls
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+                
+            return merged_df
         except Exception as e:
+            # Clean up HTTP session if using direct API calls
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
             raise e
 
     
@@ -482,6 +697,9 @@ int main() {
         model_name = f"ioi-eval-{self.model_id.replace('/', '_')}"
         if self.dry_run:
             model_name = f"dummy-{model_name}"
+
+        if self.revision:
+            model_name = f"{model_name}-{self.revision.replace('/', '_')}"
 
         if self.model_postfix:
             model_name = f"{model_name}-{self.model_postfix}"
@@ -499,12 +717,16 @@ def main():
     parser.add_argument("--api_base", help="API base URL for the model")
     parser.add_argument("--num_generations", type=int, default=50, help="Number of generations per problem")
     parser.add_argument("--num_retries", type=int, default=10, help="Number of retries for failed API calls")
-    parser.add_argument("--concurrency", type=int, default=400, help="Number of concurrent generations")
+    parser.add_argument("--concurrency", type=int, default=20, help="Number of concurrent generations")
     parser.add_argument("--num_problems", type=int, default=None, help="Number of problems to evaluate (None for all)")
     parser.add_argument("--num_subtasks", type=int, default=1, help="Number of subtasks to evaluate per problem (None for all)")
     parser.add_argument("--dry_run", action="store_true", help="Run without making actual LLM calls")
     parser.add_argument("--override", action="store_true", help="Override existing results and start fresh")
     parser.add_argument("--model_postfix", help="Postfix for the model name")
+    parser.add_argument("--revision", help="Revision to use for the model")
+    parser.add_argument("--timeout", type=int, default=600, help="Timeout for the LLM call")
+    parser.add_argument("--use_requests", action="store_true", default=False, help="Use requests instead of litellm")
+    parser.add_argument("--max_tokens", type=int, default=None, help="Max tokens")
     args = parser.parse_args()
 
     evaluator = IOIEvaluator(
@@ -518,7 +740,11 @@ def main():
         num_subtasks=args.num_subtasks,
         dry_run=args.dry_run,
         override=args.override,
-        model_postfix=args.model_postfix
+        model_postfix=args.model_postfix,
+        revision=args.revision,
+        timeout=args.timeout,
+        use_requests=args.use_requests,
+        max_tokens=args.max_tokens
     )
     asyncio.run(evaluator.run_evaluation())
 

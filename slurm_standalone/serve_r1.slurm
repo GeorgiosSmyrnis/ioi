@@ -1,8 +1,9 @@
+# Credits to Anton Lozhkov
 #!/bin/bash
 #SBATCH --job-name=r1-server
 #SBATCH --partition=hopper-prod
 #SBATCH --qos=normal
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --output=./logs/%x_%j_%n.out
@@ -13,7 +14,7 @@
 set -exuo pipefail
 
 MODEL_PATH="deepseek-ai/DeepSeek-R1"
-CONDA_ENV="sglang124"
+UV_ENV=/fsx/hynek_kydlicek/projects/ioi-leaderboard/ioi-eval
 ROUTER_ADDRESS=""
 SERVER_PORT=39877
 DIST_PORT=45000
@@ -24,67 +25,36 @@ export TRITON_HOME=/scratch/serve_r1/triton/
 export GLOO_SOCKET_IFNAME="enp71s0"
 export NCCL_SOCKET_IFNAME="enp71s0"
 
-# Add new variables for evaluation
-EVAL_SCRIPT_PATH="/fsx/hynek_kydlicek/projects/ioi-leaderboard/evaluate.py"
-EVAL_ARGS=""
-TP=16
-
-while getopts "m:a:t:c:h" opt; do
+while getopts "m:e:r:h" opt; do
     case $opt in
         m) MODEL_PATH="$OPTARG" ;;
-        a) EVAL_ARGS="$OPTARG" ;;
-        t) TP="$OPTARG" ;;
-        c) CONCURRENCY="$OPTARG" ;;
-        h|?) echo "Usage: sbatch $0 [-m MODEL_PATH] [-e CONDA_ENV] [-r ROUTER_ADDRESS] [-a EVAL_ARGS] [-t TP] [-c CONCURRENCY]"; exit 1 ;;
+        r) ROUTER_ADDRESS="$OPTARG" ;;
+        h|?) echo "Usage: sbatch $0 [-m MODEL_PATH] [-r ROUTER_ADDRESS]"; exit 1 ;;
     esac
 done
 
-# Verify required evaluation arguments
-if [ -z "$EVAL_ARGS" ]; then
-    echo "Error: Evaluation arguments (-a EVAL_ARGS) are required"
-    exit 1
-fi
-
-if [ -z $MODEL_PATH ]; then
-    echo "Error: Model path (-m MODEL_PATH) is required"
-    exit 1
-fi
-
-if [ -z $CONCURRENCY ]; then
-    echo "Error: Concurrency (-c CONCURRENCY) is required"
-    exit 1
-fi
-
+# TODO: Environment setup, adjust to your cluster configuration
 module load cuda/12.4
 source ~/.bashrc
-
-# Activate uv
-source /fsx/hynek_kydlicek/projects/ioi-leaderboard/ioi-eval/bin/activate
-
-CONTEXT_LENGTH=$(python get_context_length.py --model_name $MODEL_PATH)
-if [ -z $CONTEXT_LENGTH ]; then
-    echo "Error: Context length (-c CONTEXT_LENGTH) is required"
-    exit 1
-fi
+source $UV_ENV/bin/activate
 
 FIRST_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 FIRST_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$FIRST_NODE" hostname --ip-address)
-# FIRST_NODE_IP=$(hostname --ip-address)
 
 # Launch servers synchronously across all nodes
 # (--max-running-requests=56 is rough estimate to avoid too many evicted/preempted 16k-long requests)
-srun --nodes=1 --ntasks=1 --ntasks-per-node=1 \
+srun --nodes=2 --ntasks=2 --ntasks-per-node=1 \
     bash -c "python -m sglang.launch_server \
         --model-path '$MODEL_PATH' \
-        --tp $TP \
+        --tp 16 \
         --dist-init-addr '$FIRST_NODE_IP:$DIST_PORT' \
-        --nnodes 1 \
+        --nnodes 2 \
         --node-rank \$SLURM_PROCID \
         --port '$SERVER_PORT' \
         --host 0.0.0.0 \
         --trust-remote-code \
-        --max-running-requests $CONCURRENCY \
-        --context-length $CONTEXT_LENGTH" &
+        --max-running-requests 24 \
+        --context-length 65536" &
 
 # Wait for server with timeout
 TIMEOUT=3600  # 1h, but model loading should take ~30min
@@ -123,23 +93,16 @@ curl "http://$FIRST_NODE_IP:$SERVER_PORT/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{
         \"model\": \"default\",
-        \"prompt\": \"hi, how are you?\",
+        \"prompt\": \"<｜begin▁of▁sentence｜><｜User｜>hi, how are you?<｜Assistant｜>\",
         \"max_tokens\": 2048,
         \"temperature\": 0.6
     }"
 
-# After server is ready and health check passes, launch evaluation
-if [ -f "$EVAL_SCRIPT_PATH" ]; then
-    echo "Starting evaluation with args: $EVAL_ARGS"
-    python "$EVAL_SCRIPT_PATH" \
-        --model_id "sglang/$MODEL_PATH" \
-        --api_base "http://localhost:$SERVER_PORT/v1" \
-        --concurrency $CONCURRENCY \
-        $EVAL_ARGS
-else
-    echo "Warning: Evaluation script not found at $EVAL_SCRIPT_PATH"
-fi
-
-# Kill the server and exit
-pkill -f "python -m sglang.launch_server"
-exit 0
+# Keep the job running with health checks
+while true; do
+    if ! curl -s -o /dev/null "http://$FIRST_NODE_IP:$SERVER_PORT/health"; then
+        echo "Error: Server health check failed"
+        exit 1
+    fi
+    sleep 300
+done

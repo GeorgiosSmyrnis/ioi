@@ -9,28 +9,25 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Model configurations mapping
-MODEL_CONFIGS = {
-    # "deepseek-ai/DeepSeek-R1": {
-    #     "path": "deepseek-ai/DeepSeek-R1",
-    #     "tp": 16,
-    #     "concurrency": 56
-    # },
-}
+DEFAULT_TP = 16
+MAX_CTX_LENGTH = None
+
+MODEL_CONFIGS = {}
 
 LOGS_DIR = "/fsx/hynek_kydlicek/logs/ioi-eval"
-OUTPUT_DIR = "/fsx/hynek_kydlicek/slurm/ioi-eval/output"
+SLURM_SCRIPT_DIR = "/fsx/hynek_kydlicek/slurm/ioi-eval/output"
+UV_ENV = "/fsx/hynek_kydlicek/projects/ioi-leaderboard/ioi-eval"
 
 
-def get_concurrency(model_name: str) -> int:
+def get_concurrency(model_name: str, concurrency: int) -> int:
     """Get concurrency from model config."""
-    return MODEL_CONFIGS.get(model_name, {}).get("concurrency", 100)
+    return MODEL_CONFIGS.get(model_name, {}).get("concurrency", concurrency)
 
 
-def get_tp(model_name: str) -> int:
-    default_tp = MODEL_CONFIGS.get(model_name, {}).get("tp", 16)
+def get_tp(model_name: str, revision: str) -> int:
+    default_tp = MODEL_CONFIGS.get(model_name, {}).get("tp", DEFAULT_TP)
     try:
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_name, revision=revision, trust_remote_code=True)
 
         # Check num_attention_heads and num_key_value_heads, and ensure that both are divisable by tp
         if hasattr(config, 'num_attention_heads'):
@@ -44,10 +41,10 @@ def get_tp(model_name: str) -> int:
         print(f"Could not get tp from config for {model_name}: {e}")
         return default_tp
 
-def get_context_length(model_name: str) -> int:
+def get_context_length(model_name: str, revision: str) -> int:
     """Get maximum context length from model config."""
     try:
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_name, revision=revision, trust_remote_code=True)
         # Check various possible context length attributes
         context_length = (
             getattr(config, 'max_position_embeddings', None) or
@@ -63,8 +60,10 @@ def get_context_length(model_name: str) -> int:
             context_length = getattr(config, 'max_position_embeddings', context_length)
             
 
-        # Cap to 32k
-        return min(context_length, 32768)
+        # cap to 64k
+        if MAX_CTX_LENGTH is not None:
+            context_length = min(context_length, MAX_CTX_LENGTH)
+        return context_length
     except Exception as e:
         logger.warning(f"Could not get context length from config for {model_name}: {e}")
         return 4096  # Default fallback
@@ -81,25 +80,37 @@ def parse_args():
                         help="Slurm partition")
     parser.add_argument("--qos", type=str, default="normal",
                         help="Slurm QOS")
+    parser.add_argument("--startup_delay", type=int, default=3600,
+                        help="Delay in seconds before starting the server")
     parser.add_argument("--dry_run", action="store_true",
                         help="Generate script but don't submit job")
+
+    parser.add_argument("--revision", type=str, default=None, help="Revision to use for the model")
+    parser.add_argument("--concurrency", type=int, default=100,
+                        help="Number of concurrent requests to the server")
+    
+    parser.add_argument("--uv_env", type=str, default=None, help="Path to the uv env")
+    parser.add_argument("--logs_dir", type=str, default=None)
+    parser.add_argument("--slurm_dir", type=str, default=None)
     
     return parser.parse_args()
 
-def create_slurm_script(args):
+def create_slurm_script(args, logs_dir):
     # Override with custom values if provided
-    concurrency = get_concurrency(args.model)
-    tp = get_tp(args.model)
-    context_length = get_context_length(args.model)
+    concurrency = get_concurrency(args.model, args.concurrency)
+    tp = get_tp(args.model, args.revision)
+    context_length = get_context_length(args.model, args.revision)
     
     # Create a sanitized model name for the job name
     job_name = f"ioi-eval-{args.model.replace('/', '-')}"
 
-    log_dir = Path(LOGS_DIR) / job_name
+    log_dir = logs_dir / job_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
     n_nodes = ceil(tp / 8)
     tasks = n_nodes
+
+    revision_arg = f"--revision {args.revision}" if args.revision else ""
     
     slurm_script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
@@ -134,10 +145,10 @@ module load cuda/12.4
 source ~/.bashrc
 
 # Activate uv
-source /fsx/hynek_kydlicek/projects/ioi-leaderboard/ioi-eval/bin/activate
+source {args.uv_env or UV_ENV}/bin/activate
 
 FIRST_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
-FIRST_NODE_IP=$(srun --nodes={n_nodes} -w "$FIRST_NODE" hostname --ip-address)
+FIRST_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$FIRST_NODE" hostname --ip-address)
 
 # Launch servers synchronously across all nodes
 srun --nodes={n_nodes} --ntasks={tasks} --ntasks-per-node=1 \\
@@ -145,6 +156,7 @@ srun --nodes={n_nodes} --ntasks={tasks} --ntasks-per-node=1 \\
         --model-path '{args.model}' \\
         --tp {tp} \\
         --dist-init-addr '$FIRST_NODE_IP:$DIST_PORT' \\
+        {revision_arg} \\
         --nnodes {n_nodes} \\
         --node-rank \\$SLURM_PROCID \\
         --port '$SERVER_PORT' \\
@@ -154,7 +166,7 @@ srun --nodes={n_nodes} --ntasks={tasks} --ntasks-per-node=1 \\
         --context-length {context_length}" &
 
 # Wait for server with timeout
-TIMEOUT=3600  # 1h, but model loading should take ~30min
+TIMEOUT={args.startup_delay}  # 1h, but model loading should take ~30min
 START_TIME=$(date +%s)
 echo "Waiting for SGLang server (http://$FIRST_NODE_IP:$SERVER_PORT)..."
 
@@ -190,6 +202,7 @@ curl "http://$FIRST_NODE_IP:$SERVER_PORT/v1/completions" \\
 
 python "$EVAL_SCRIPT_PATH" \\
     --model_id "sglang/{args.model}" \\
+    {revision_arg} \\
     --api_base "http://localhost:$SERVER_PORT/v1" \\
     --concurrency {concurrency} \\
     {args.eval_args}
@@ -205,15 +218,15 @@ def main():
     args = parse_args()
     
     # Create output directory if it doesn't exist
-    output_dir = Path(OUTPUT_DIR)
+    output_dir = Path(args.slurm_dir or SLURM_SCRIPT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Create logs directory if it doesn't exist
-    logs_dir = Path(LOGS_DIR)
+    logs_dir = Path(args.logs_dir or LOGS_DIR)
     logs_dir.mkdir(parents=True, exist_ok=True)
     
     # Generate the Slurm script
-    slurm_script, job_name = create_slurm_script(args)
+    slurm_script, job_name = create_slurm_script(args, logs_dir)
     
     # Create a timestamp for the filename
     from datetime import datetime

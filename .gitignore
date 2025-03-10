@@ -43,6 +43,4 @@ ENV/
 .DS_Store
 
 # Project specific
-*.log
-evaluation.log
-*/ioi-leaderboard-*/  # Evaluation results directories 
+results/
