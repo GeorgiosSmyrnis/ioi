@@ -139,7 +139,7 @@ export GLOO_SOCKET_IFNAME="enp71s0"
 export NCCL_SOCKET_IFNAME="enp71s0"
 
 # Evaluation script path
-EVAL_SCRIPT_PATH="/fsx/hynek_kydlicek/projects/ioi-leaderboard/evaluate.py"
+EVAL_SCRIPT_PATH="/fsx/hynek_kydlicek/projects/ioi/generate/evaluate.py"
 
 module load cuda/12.4
 source ~/.bashrc

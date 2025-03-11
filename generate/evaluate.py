@@ -1,56 +1,37 @@
 import asyncio
+from collections import defaultdict
 import json
-import os
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 import random
 from datetime import datetime
-import re
 import uuid
 from datasets import Dataset, load_dataset
 from loguru import logger
 from tqdm.asyncio import tqdm
 import litellm
 from dotenv import load_dotenv
-from huggingface_hub import HfApi
 import polars as pl
 import aiofiles
-from aiofiles.threadpool.text import AsyncTextIOWrapper
-from litellm.utils import ModelResponse, Message, Usage, Choices
-
-PROMPT = """\
-You are an expert competitive programmer. You will be given a problem statement, test case constraints and example test inputs and outputs. Please reason step by step about the solution, then provide a complete implementation in C++17. You should correctly implement the routine(s) described in Implementation Details, without reading or writing anything directly from stdin or to stdout, as input and output are passed through the implemented routines. Assume your code will be run on the OFFICIAL grader, and do not add a main, a sample grader, or any other functionality unless it has been explicitly requested.
-Put your final solution within a single code block: ```cpp\n<your code here>``` 
-
-# Problem statement ({problem_name})
-{problem_statement}
-
-## Time limit
-Your solution will have {time_limit} second(s) execution time and {memory_limit}MB memory limit to solve each test case.
-
-# Starting code
-Here's your starting code with some skeleton/placeholder functionality:
-```cpp
-{skeleton}
-```\
-"""
+from litellm.utils import ModelResponse
 
 class IOIEvaluator:
-    def __init__(self, org_id: str, model_id: str, api_base: Optional[str] = None, 
+    def __init__(self, org_id: str, model_id: str, api_base: Optional[str] = None,  subset: Optional[str] = None,
                  num_generations: int = 50, num_retries: int = 10, 
                  concurrency: int = 10, num_problems: Optional[int] = None, 
-                 num_subtasks: Optional[int] = None, dry_run: bool = False,
+                 last_subtask: bool = False, dry_run: bool = False,
                  override: bool = False, model_postfix: Optional[str] = None,
                  revision: Optional[str] = None, timeout: Optional[int] = 600,
                  use_requests: bool = False, max_tokens: Optional[int] = None):
         self.org_id = org_id
         self.model_id = model_id
         self.api_base = api_base
+        self.subset = subset
         self.num_generations = num_generations
         self.num_retries = num_retries
         self.concurrency = concurrency
         self.num_problems = num_problems
-        self.num_subtasks = num_subtasks
+        self.last_subtask = last_subtask
         self.dry_run = dry_run
         self.override = override
         self.revision = revision
@@ -90,9 +71,10 @@ class IOIEvaluator:
         # Lock for file access
         self._file_lock = asyncio.Lock()
 
-    async def save_result_locally(self, result: Dict, problem_id: str, subtask: str, solution_number: int):
+    async def save_result_locally(self, result: Dict, year: int, problem_id: str, subtask: str, solution_number: int):
         """Save a single result to local JSONL storage with locking."""
         # Ensure problem_id is included in the result
+        result['year'] = str(year)
         result['problem_id'] = problem_id
         result['subtask'] = subtask
         result['solution_number'] = solution_number
@@ -157,10 +139,17 @@ class IOIEvaluator:
         # Combine results if we have any
         if results_dfs:
             # Select just columns: 'generation', 'code', 'language', 'model_kwargs', 'metadata', 'uuid', 'problem_id', 'subtask', 'solution_number', 'is_local'
-            common_columns = ['generation', 'code', 'language', 'model_kwargs', 'metadata', 'uuid', 'problem_id', 'subtask', 'solution_number', 'is_local']
+            common_columns = ['generation', 'code', 'language', 'model_kwargs', 'metadata', 'uuid', 'year', 'problem_id', 'subtask', 'solution_number', 'is_local']
 
+            # Add missing 'year' column with None values if needed
+            results_dfs = [df if 'year' in df.columns else df.with_columns(pl.lit(None).alias('year')) for df in results_dfs]
+            
             # Drop that are not in common_columns
             results_dfs = [df.select(common_columns) for df in results_dfs]
+            # Print shapes/structs for each dataframe
+            for i, df in enumerate(results_dfs):
+                logger.info(f"DataFrame {i} shape: {df.shape}")
+                logger.info(f"DataFrame {i} schema:\n{df.schema}")
 
             # Try this instead:
             # Add stop_reason to metadata if it doesn't exist
@@ -184,7 +173,7 @@ class IOIEvaluator:
                 .sort(['has_code', 'is_local'], descending=[True, True])
                 # Keep first occurrence after sorting (prioritizing entries with code and local source)
                 .unique(
-                    subset=["problem_id", "subtask", "solution_number"],
+                    subset=["year", "problem_id", "subtask", "solution_number"],
                     keep='first'
                 )
                 # Drop the temporary columns
@@ -195,37 +184,6 @@ class IOIEvaluator:
             return deduplicated_df
         
         return None
-
-    def load_ioi_dataset(self):
-        """Load the IOI 2024 dataset from Huggingface."""
-        logger.info("Loading IOI 2024 dataset...")
-        dataset = load_dataset("open-r1/ioi-2024", split="train")
-        if isinstance(dataset, dict):
-            # Handle DatasetDict case
-            dataset = dataset['train']
-        return dataset.to_polars()
-    
-    def get_subtasks(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
-        """Get all subtasks for a given problem ID."""
-        subtasks = dataset.filter(pl.col("id") == problem_id).select(pl.col("subtask", "statement", "time_limit", "starting_code", "memory_limit")).unique().to_dicts()
-        # If n_subtasks is set, limit the number of subtasks
-        if self.num_subtasks is not None and self.num_subtasks > 0:
-            # Sort subtasks by ID to ensure consistent selection
-            subtasks = sorted(subtasks, key=lambda x: int(x["subtask"][:2]))
-            subtasks = subtasks[-self.num_subtasks:]
-            
-        return subtasks
-
-    def get_next_subtask(self, subtasks: List[Dict]) -> Optional[Dict]:
-        """Get the subtask with the highest ID."""
-        # Extract subtask IDs (first two digits)
-        try:
-            subtask_ids = [int(task["subtask"][:2]) for task in subtasks]
-        except ValueError:
-            logger.error(f"Failed to convert subtask IDs to integers for problem {subtasks[0]['id']}")
-            subtask_ids = list(range(len(subtasks)))
-
-        return subtasks[subtask_ids.index(max(subtask_ids))]
 
     def get_dummy_response(self, prompt: str, seed: int) -> Dict:
         """Generate a dummy response for dry runs."""
@@ -343,7 +301,7 @@ int main() {
         raise Exception("All retries failed for direct API call")
                 
 
-    async def call_llm(self, prompt: str, seed: int, problem_id: str, subtask: str, solution_number: int) -> Dict:
+    async def call_llm(self, prompt: str, seed: int) -> Dict:
         """Call the LLM using LiteLLM's built-in retry mechanism or direct asyncio requests."""
         if self.dry_run:
             result = self.get_dummy_response(prompt, seed)
@@ -430,38 +388,18 @@ int main() {
         }
         return result
 
-    def prepare_prompt(self, task: dict) -> str:
-        statement = task['statement']
-        task_name, statement = statement.split("\n\n", maxsplit=1)
-        task_name = task_name.lstrip("# ")
-        time_limit = task['time_limit']
-        skeleton = task['starting_code'].strip()
-        memory_limit = int(task['memory_limit']/1024/1024)
-
-        return PROMPT.format(
-            problem_name=task_name,
-            problem_statement=statement,
-            time_limit=time_limit,
-            memory_limit=memory_limit,
-            skeleton=skeleton
-        )
-
-    async def create_solution_requests(self, problem_id: str, dataset: pl.DataFrame) -> List[Dict]:
+    async def create_solution_requests(self, subtasks: List[Dict]) -> List[Dict]:
         """Prepare result entries for a single problem."""
-        subtasks = self.get_subtasks(problem_id, dataset)
-        if not subtasks:
-            logger.warning(f"No subtasks found for problem {problem_id}")
-            return []
-        
         results = []
         for subtask in subtasks:
-            prompt = self.prepare_prompt(subtask)
+            prompt = subtask['problem']
             for i in range(self.num_generations):
                 try:
                     random_uuid = str(uuid.uuid4())
                     
                     results.append({
-                        "problem_id": problem_id,
+                        "year": subtask['year'],
+                        "problem_id": subtask['id'],
                         "subtask": subtask["subtask"],
                         "prompt": prompt,
                         "generation": None,
@@ -476,7 +414,7 @@ int main() {
                         }
                     })
                 except Exception as e:
-                    logger.error(f"Failed to prepare prompts for problem {problem_id}: {str(e)}")
+                    logger.error(f"Failed to prepare prompts for problem {subtask['id']}, subtask {subtask['subtask']}: {str(e)}")
                     return []
 
         return results
@@ -489,26 +427,27 @@ int main() {
                 import aiohttp
                 self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout), connector=aiohttp.TCPConnector(limit=self.concurrency, ttl_dns_cache=300, keepalive_timeout=self.timeout))
                 
-            ioi_dataset = self.load_ioi_dataset()
-            # Get unique problem IDs
-            try:
-                # Extract unique problem IDs using polars
-                problem_ids = ioi_dataset.select(pl.col("id")).unique().to_series().to_list()
-                problem_ids.sort()
-                if self.num_problems is not None:
-                    problem_ids = problem_ids[:self.num_problems]
-                    logger.info(f"Limited evaluation to first {self.num_problems} problems")
-            except Exception as e:
-                logger.error(f"Failed to extract problem IDs: {str(e)}")
-                return []
+            
+            logger.info(f"Loading IOI dataset for subset: {self.subset}")
+            dataset = load_dataset("open-r1/ioi", split=self.subset)
+            problem_subtasks = defaultdict(list)
+            for problem in dataset:
+                problem_subtasks[(problem["year"], problem["id"])].append(problem)
+            problem_ids = list(problem_subtasks.keys())
+            if self.num_problems is not None:
+                problem_ids = problem_ids[:self.num_problems]
+                logger.info(f"Limited evaluation to first {self.num_problems} problems")
             
             logger.info(f"Starting evaluation of {len(problem_ids)} problems...")
 
             # Step 1: Generate all solution requests
             all_solution_requests = []
             for problem_id in tqdm(problem_ids, desc="Preparing solution requests"):
-                request = await self.create_solution_requests(problem_id, ioi_dataset)
-                all_solution_requests.extend(request)
+                subtasks = problem_subtasks[problem_id]
+                if self.last_subtask:
+                    subtasks = [subtasks[-1]]
+                requests = await self.create_solution_requests(subtasks)
+                all_solution_requests.extend(requests)
             
             # Convert to Polars DataFrame for efficient operations
             requests_df = pl.DataFrame(all_solution_requests)
@@ -575,10 +514,7 @@ int main() {
                     try:
                         llm_result = await self.call_llm(
                             row["prompt"], 
-                            row["model_kwargs"]["seed"],
-                            row["problem_id"],
-                            row["subtask"],
-                            row["solution_number"]
+                            row["model_kwargs"]["seed"]
                         )
                         
                         # Log progress and token usage
@@ -595,7 +531,7 @@ int main() {
                         llm_result["uuid"] = row["uuid"]
 
                         # Save result immediately
-                        await self.save_result_locally(llm_result, row["problem_id"], row["subtask"], row["solution_number"])
+                        await self.save_result_locally(llm_result, row["year"], row["problem_id"], row["subtask"], row["solution_number"])
 
                         return llm_result
                     except Exception as e:
@@ -715,11 +651,12 @@ def main():
     parser.add_argument("--org_id", required=True, help="Organization ID")
     parser.add_argument("--model_id", required=True, help="Model ID")
     parser.add_argument("--api_base", help="API base URL for the model")
+    parser.add_argument("--subset", default="test", help="IOI subset to generate solutions for (train or test)")
     parser.add_argument("--num_generations", type=int, default=50, help="Number of generations per problem")
     parser.add_argument("--num_retries", type=int, default=10, help="Number of retries for failed API calls")
     parser.add_argument("--concurrency", type=int, default=20, help="Number of concurrent generations")
     parser.add_argument("--num_problems", type=int, default=None, help="Number of problems to evaluate (None for all)")
-    parser.add_argument("--num_subtasks", type=int, default=1, help="Number of subtasks to evaluate per problem (None for all)")
+    parser.add_argument("--last_subtask", action="store_true", help="Only evaluate the last subtask for each problem (usually the full problem)")
     parser.add_argument("--dry_run", action="store_true", help="Run without making actual LLM calls")
     parser.add_argument("--override", action="store_true", help="Override existing results and start fresh")
     parser.add_argument("--model_postfix", help="Postfix for the model name")
@@ -733,11 +670,12 @@ def main():
         org_id=args.org_id,
         model_id=args.model_id,
         api_base=args.api_base,
+        subset=args.subset,
         num_generations=args.num_generations,
         num_retries=args.num_retries,
         concurrency=args.concurrency,
         num_problems=args.num_problems,
-        num_subtasks=args.num_subtasks,
+        last_subtask=args.last_subtask,
         dry_run=args.dry_run,
         override=args.override,
         model_postfix=args.model_postfix,
