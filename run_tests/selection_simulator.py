@@ -35,7 +35,7 @@ def simulate_round_robin(all_submissions) -> float:
 
     for submission in all_submissions:
         # if it failed to compile, skip
-        if submission['all_subtasks_results'][0]['status'] == 'CE':
+        if not submission["code"] or submission['all_subtasks_results'][0]['status'] == 'CE':
             continue
         submissions_by_target_subtask[submission['target_subtask']].append(submission)
 

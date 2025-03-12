@@ -31,7 +31,8 @@ class TestsRunner:
         timeout: int = 60 * 10,
         id_column: str = "uuid",
         add_messages_column: bool = False,
-        add_includes: bool = True
+        add_includes: bool = True,
+        always_extract_code: bool = False
     ):
         self.datasets_to_evaluate = datasets_to_evaluate if isinstance(
             datasets_to_evaluate, list) else [datasets_to_evaluate]
@@ -47,7 +48,7 @@ class TestsRunner:
         self.add_messages_column = add_messages_column
         self.add_includes = add_includes
         self.max_concurrent_requests = max_concurrent_requests
-
+        self.always_extract_code = always_extract_code
         os.makedirs(self.local_results_cache, exist_ok=True)
 
         if dry_run:
@@ -97,7 +98,7 @@ class TestsRunner:
                     completed_ids[dsname].add(id_key)
 
                     # source code parsing
-                    if 'code' not in submission or not submission['code']:
+                    if 'code' not in submission or not submission['code'] or self.always_extract_code:
                         # try extracting code from generation if it exists
                         if 'generation' not in submission or "```cpp\n" not in submission['generation']:
                             submission['code'] = None
@@ -195,7 +196,7 @@ class TestsRunner:
                                 full_result_data = {
                                     **submission,
                                     "target_subtask": target_subtask,
-                                    "code_compiles": all(subtask_results.status != "CE" for subtask_results in all_subtask_results),
+                                    "code_compiles": submission["code"] and all(subtask_results.status != "CE" for subtask_results in all_subtask_results),
                                     "target_subtask_score": target_subtask_results[0].score if target_subtask_results else None,
                                     "target_subtask_status": target_subtask_results[0].status if target_subtask_results else None,
                                     "all_subtasks_points": sum([subtask_results.weighted_score for subtask_results in all_subtask_results]),
@@ -282,6 +283,7 @@ class TestsRunner:
                 table_data = [
                     {
                         "Submission": submission[self.id_column],
+                        "Target subtask": submission.get('target_subtask', '-'),
                         "Total": submission["all_subtasks_points"],
                         **{
                             subtask['subtask']: f"{subtask['weighted_score']}/{subtask['points']} ({subtask['status']})"
@@ -393,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument('--timeout', type=int, default=60 * 10, help="timeout for the piston client requests keep alive")
     parser.add_argument('--add_includes', action="store_true", help="try to fix missing includes in the code")
     parser.add_argument('--add_messages_column', action="store_true", help="add a messages column to the results, for SFT")
-
+    parser.add_argument('--always_extract_code', action="store_true", help="always extract code from generation, even if it already exists in the code column")
     args = parser.parse_args()
 
     runner = TestsRunner(
@@ -408,6 +410,7 @@ if __name__ == "__main__":
         id_column=args.id_column,
         add_messages_column=args.add_messages_column,
         add_includes=args.add_includes,
+        always_extract_code=args.always_extract_code
     )
 
     uvloop.install()
