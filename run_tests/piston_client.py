@@ -13,14 +13,14 @@ class PistonError(Exception):
     pass
 
 @lru_cache(maxsize=1)
-def get_piston_client_from_env():
+def get_piston_client_from_env(session=None):
     piston_endpoints = os.getenv("PISTON_ENDPOINTS")
     if piston_endpoints is None:
         raise ValueError("For IOI problems Piston endpoints running our IOI package are required. Please add a list of valid Piston endpoints to a PISTON_ENDPOINTS varialbe in a `.env` file.")
     piston_endpoints = piston_endpoints.split(",") if piston_endpoints != "slurm" else get_slurm_piston_endpoints()
     random.shuffle(piston_endpoints)
     max_requests_per_endpoint = os.getenv("PISTON_MAX_REQUESTS_PER_ENDPOINT", "1")
-    return PistonClient(piston_endpoints, max_requests_per_endpoint=int(max_requests_per_endpoint))
+    return PistonClient(piston_endpoints, session, max_requests_per_endpoint=int(max_requests_per_endpoint))
 
 class PistonClient:
     """
@@ -47,6 +47,8 @@ class PistonClient:
     def __init__(self, base_endpoint: str | list[str] = "http://ip-10-53-80-65:3223/api/v2", session=None, max_requests_per_endpoint=1):
         self.max_requests_per_endpoint = max_requests_per_endpoint
         self.base_endpoints = [base_endpoint] if isinstance(base_endpoint, str) else base_endpoint
+        if len(self.base_endpoints) == 0:
+            raise ValueError("No Piston endpoints provided. Please check your PISTON_ENDPOINTS environment variable.")
         self.endpoint_ids = {endpoint: i for i, endpoint in enumerate(self.base_endpoints)}
 
         self._session = session
@@ -145,6 +147,8 @@ class PistonClient:
             except Exception as e:
                 print(f"Error checking endpoint {endpoint}, dropping it ({e})")
                 self._unhealthy_endpoints.add(endpoint)
+                if len(self._unhealthy_endpoints) >= len(self.base_endpoints):
+                    raise PistonError("All endpoints are unhealthy. Please check your Piston workers.")
 
     async def _send_execute(self, data):
         data = data | {

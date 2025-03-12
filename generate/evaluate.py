@@ -74,7 +74,7 @@ class IOIEvaluator:
     async def save_result_locally(self, result: Dict, year: int, problem_id: str, subtask: str, solution_number: int):
         """Save a single result to local JSONL storage with locking."""
         # Ensure problem_id is included in the result
-        result['year'] = str(year)
+        result['year'] = year
         result['problem_id'] = problem_id
         result['subtask'] = subtask
         result['solution_number'] = solution_number
@@ -146,10 +146,6 @@ class IOIEvaluator:
             
             # Drop that are not in common_columns
             results_dfs = [df.select(common_columns) for df in results_dfs]
-            # Print shapes/structs for each dataframe
-            for i, df in enumerate(results_dfs):
-                logger.info(f"DataFrame {i} shape: {df.shape}")
-                logger.info(f"DataFrame {i} schema:\n{df.schema}")
 
             # Try this instead:
             # Add stop_reason to metadata if it doesn't exist
@@ -466,13 +462,13 @@ int main() {
                 # Keep only the columns we want to preserve from previous results
                 preserve_cols = ['generation', 'code', 'language', 'metadata', 'model_kwargs']
 
-                preserve_cols_with_key = preserve_cols + ['problem_id', 'subtask', 'solution_number']
+                preserve_cols_with_key = preserve_cols + ['year', 'problem_id', 'subtask', 'solution_number']
                 previous_df = previous_df.select(preserve_cols_with_key).filter(pl.col('generation').is_not_null() & (pl.col('generation') != ""))
                 
                 # Merge using polars, keeping all solution requests and only matching previous results
                 merged_df = requests_df.join(
                     previous_df,
-                    on=('problem_id', 'subtask', 'solution_number'),
+                    on=('year', 'problem_id', 'subtask', 'solution_number'),
                     how='left',
                     suffix='_prev'
                 )

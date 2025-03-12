@@ -2,8 +2,8 @@ import asyncio
 from dataclasses import asdict, dataclass, field
 from typing import Union
 
-from .piston_client import PistonClient
-from .utils import batched, load_ioi_tests
+from piston_client import PistonClient
+from utils import batched, load_ioi_tests
 
 
 @dataclass
@@ -204,7 +204,7 @@ async def score_subtask(client: PistonClient, subtask: dict, submission: str, te
     return subtask_result
 
 
-async def score_subtasks(client: PistonClient, subtasks: list[dict], submission: str, skip_mode: bool = True) -> list[SubtaskResult]:
+async def score_subtasks(client: PistonClient, subtasks: list[dict], submission: str, test_batch_size: int = 1) -> list[SubtaskResult]:
     """
     Scores multiple subtasks for a submission.
     
@@ -212,7 +212,8 @@ async def score_subtasks(client: PistonClient, subtasks: list[dict], submission:
         client: PistonClient instance for executing code
         subtasks: List of dictionaries containing subtask configurations
         submission: Source code of the submission
-        skip_mode: If True, evaluates test by test and stops after the first failure. Otherwise, runs all tests in parallel. Should be True when evaluating a large number of submissions.
+        test_batch_size: evaluate these many test cases in parallel, then check if any of them failed (0 score): if so stop evaluating; otherwise continue with the next batch of test cases.
+        -1 to evaluate all test cases in parallel
         
     Returns:
         list[SubtaskResult]: Results for all subtasks
@@ -221,7 +222,7 @@ async def score_subtasks(client: PistonClient, subtasks: list[dict], submission:
     test_case_run_cache = {}
 
     return [
-        await score_subtask(client, subtask, submission, test_case_run_cache, skip_mode)
+        await score_subtask(client, subtask, submission, test_case_run_cache, test_batch_size)
         for subtask in subtasks
     ]
 

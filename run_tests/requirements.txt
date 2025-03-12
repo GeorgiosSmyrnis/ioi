@@ -1,0 +1,8 @@
+datasets>=3.3.2
+tqdm
+python-dotenv
+loguru
+aiohttp
+huggingface_hub
+aiofiles
+uvloop
