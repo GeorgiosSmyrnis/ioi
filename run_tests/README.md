@@ -58,8 +58,8 @@ To evaluate in a different sandbox environment, you should change the `run_submi
 - `correct_output.txt`: The expected output for the problem.
 - all the files in `grader_files`
 Plus the following 2 very important files:
-- `compile`, the command to compile the submission code with all the grader/checker/manager files.
-- `run`, the command to orchestrate the execution of the submission code, managers, time limits, output checking, etc.
+- [`compile`](custom_setup/compile), the command to compile the submission code with all the grader/checker/manager files.
+- [`run`](custom_setup/run), the command to orchestrate the execution of the submission code, managers, time limits, output checking, etc.
 
 As `run` handles time limits, if you require a time limit for a sandbox, you can set a hard limit to 2 or 3 additional seconds from the problem's time limit.
 
