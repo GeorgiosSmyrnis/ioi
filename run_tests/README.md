@@ -1,7 +1,5 @@
 # IOI: Running tests
 
-[WIP]
-
 ## Piston
 To evaluate, we rely on Piston (https://github.com/engineer-man/piston) to compile and run the code in a secure and fast sandbox environment. See the [piston](piston/README.md) directory for more details.
 You should copy the `.env.template` file to `.env` and set the piston variables.
