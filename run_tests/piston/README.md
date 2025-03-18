@@ -10,7 +10,7 @@ To launch a fleet of piston workers on a Slurm cluster, you can adapt the `/fsx`
 This command will launch a Slurm job for each worker, which will be called `piston-worker-<port>`, where `<port>` is the port where the worker will be listening.
 
 > [!TIP]
-> To accelerate evaluation, we recommend spinning up as many Piston workers as possible. For example, our evaluations are typically wun with 1,500 workers.
+> To accelerate evaluation, we recommend spinning up as many Piston workers as possible. For example, our evaluations are typically run with 1,500 workers.
 
 ## First time setup
 
