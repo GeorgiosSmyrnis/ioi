@@ -23,7 +23,7 @@ You will need to install the [IOI package](https://github.com/guipenedo/piston/t
 
 2. Assuming it's running on `ip-10-53-86-146:1234`, send the package install request:
 ```bash
-curl -X POST http://ip-10-53-94-249:5699/api/v2/packages -H "Content-Type: application/json" -d '{"language": "cms_ioi", "version": "1.0.0"}'
+curl -X POST http://ip-10-53-86-146:1234/api/v2/packages -H "Content-Type: application/json" -d '{"language": "cms_ioi", "version": "1.0.0"}'
 ```
 
 3. You can now launch more workers and due to the shared mounted packages directory, they should already have the package installed.
