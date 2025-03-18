@@ -5,7 +5,11 @@ This repository contains code for evaluating Language Models on IOI 2024 problem
 ## Installation
 
 1. Clone the repository
-2. Install dependencies:
+2. Create a virtual environment with `uv` (to install `uv`, follow the [UV Installation Guide](https://docs.astral.sh/uv/getting-started/installation/)):
+```bash
+uv venv ioi --python 3.11 && source ioi/bin/activate && uv pip install --upgrade pip
+```
+3. Install dependencies:
 ```bash
 
 uv pip install torch~=2.5.1 --index-url https://download.pytorch.org/whl/cu124
@@ -64,15 +68,16 @@ For locally deployed models using SGLang, you can use the provided scripts:
 
 #### Using SLURM for Distributed Deployment
 
-For HPC environments with SLURM, use run_ioi_slurm.py to evaluate open models:
+For HPC environments with SLURM, use `run_ioi_slurm.py` to evaluate open models:
 
 ```bash
-python run_ioi_slurm.py --model "MODEL_PATH" --concurrency=30 --startup_delay="7200" --log_dir "DIR_FOR_OUTPUT_LOGS" --slurm_dir "DIR_FOR_SLUR_SCRIPT" --uv_env "PATH_TO_UV_ENV" --eval_args "--org_id=YOUR_ORG_ID --num_problems=50 --num_generations=50 --model_postfix=POSTFIX --num_subtasks=-1"
+python run_ioi_slurm.py --model "MODEL_PATH" --concurrency 30 --startup_delay 7200 --logs_dir "DIR_FOR_OUTPUT_LOGS" --slurm_dir "DIR_FOR_SLUR_SCRIPT" --uv_env "PATH_TO_UV_ENV" --eval_args "--org_id YOUR_ORG_ID"
 ```
 
 ## Output
 
-The results will be saved in the directory structure:
+The results will be saved in directory specified by `--logs_dir` with structure:
+
 ```
 {org_id}/{revision}-{model_id}-{postfix}/
 ```
