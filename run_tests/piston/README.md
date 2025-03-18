@@ -1,16 +1,21 @@
-# Piston workers (slurm)
+# Piston workers (Slurm)
 
 We have built a [piston](https://github.com/engineer-man/piston) package to run IOI problems.
 
-To launch a fleet of piston workers on a slurm cluster, you can adapt the paths in `launch_piston_workers.sh` and `launch_single_piston.sh` and run:
+To launch a fleet of piston workers on a Slurm cluster, you can adapt the `/fsx` paths in `launch_piston_workers.sh` and `launch_single_piston.sh` and run:
 ```bash
 ./launch_piston_workers.sh (number of workers to launch)
 ```
 
-This command will launch a slurm job for each worker, which will be called `piston-worker-<port>`, where `<port>` is the port where the worker will be listening.
+This command will launch a Slurm job for each worker, which will be called `piston-worker-<port>`, where `<port>` is the port where the worker will be listening.
+
+> [!TIP]
+> To accelerate evaluation, we recommend spinning up as many Piston workers as possible. For example, our evaluations are typically run with 1,500 workers.
 
 ## First time setup
-You will need to install the [IOI package](https://github.com/guipenedo/piston/tree/master/packages/cms_ioi/1.0.0) in the workers.
+
+You will need to install the [IOI package](https://github.com/guipenedo/piston/tree/master/packages/cms_ioi/1.0.0) in the workers. To do so, run the following steps:
+
 1. Launch a single worker:
 ```bash
 ./launch_piston_workers.sh 1

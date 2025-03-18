@@ -6,3 +6,4 @@ aiohttp
 huggingface_hub
 aiofiles
 uvloop
+tabulate
