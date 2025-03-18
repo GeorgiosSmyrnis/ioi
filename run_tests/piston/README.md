@@ -1,16 +1,21 @@
-# Piston workers (slurm)
+# Piston workers (Slurm)
 
 We have built a [piston](https://github.com/engineer-man/piston) package to run IOI problems.
 
-To launch a fleet of piston workers on a slurm cluster, you can adapt the paths in `launch_piston_workers.sh` and `launch_single_piston.sh` and run:
+To launch a fleet of piston workers on a Slurm cluster, you can adapt the `/fsx` paths in `launch_piston_workers.sh` and `launch_single_piston.sh` and run:
 ```bash
 ./launch_piston_workers.sh (number of workers to launch)
 ```
 
-This command will launch a slurm job for each worker, which will be called `piston-worker-<port>`, where `<port>` is the port where the worker will be listening.
+This command will launch a Slurm job for each worker, which will be called `piston-worker-<port>`, where `<port>` is the port where the worker will be listening.
+
+> [!TIP]
+> To accelerate evaluation, we recommend spinning up as many Piston workers as possible. For example, our evaluations are typically wun with 1,500 workers.
 
 ## First time setup
-You will need to install the [IOI package](https://github.com/guipenedo/piston/tree/master/packages/cms_ioi/1.0.0) in the workers.
+
+You will need to install the [IOI package](https://github.com/guipenedo/piston/tree/master/packages/cms_ioi/1.0.0) in the workers. To do so, run the following steps:
+
 1. Launch a single worker:
 ```bash
 ./launch_piston_workers.sh 1
@@ -18,7 +23,7 @@ You will need to install the [IOI package](https://github.com/guipenedo/piston/t
 
 2. Assuming it's running on `ip-10-53-86-146:1234`, send the package install request:
 ```bash
-curl -X POST http://ip-10-53-86-146:1234/api/v2/packages -H "Content-Type: application/json" -d '{"language": "cms_ioi", "version": "1.0.0"}'
+curl -X POST http://ip-10-53-94-249:5699/api/v2/packages -H "Content-Type: application/json" -d '{"language": "cms_ioi", "version": "1.0.0"}'
 ```
 
 3. You can now launch more workers and due to the shared mounted packages directory, they should already have the package installed.

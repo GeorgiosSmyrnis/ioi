@@ -187,7 +187,7 @@ class PistonClient:
                     delay = min(base_delay * (2 ** attempt), 10)  # Exponential backoff, capped at 10 seconds
                     jitter = delay * 0.2 * (2 * asyncio.get_event_loop().time() % 1 - 0.5)  # Add ±10% jitter
                     retry_delay = delay + jitter
-                    print(f"Retrying in {retry_delay} seconds [{self.endpoint_ids[endpoint]}] {endpoint}")
+                    print(f"Retrying in {retry_delay:.2f} seconds [{self.endpoint_ids[endpoint]}] {endpoint}")
 
                     # special case: worker died
                     if isinstance(e, aiohttp.ClientConnectionError) and "Connect call failed" in str(e):

@@ -2,7 +2,7 @@
 
 ## Piston
 To evaluate, we rely on Piston (https://github.com/engineer-man/piston) to compile and run the code in a secure and fast sandbox environment. See the [piston](piston/README.md) directory for more details.
-You should copy the `.env.template` file to `.env` and set the piston variables.
+To run the evaluation code below, spin up Piston workers and copy the `.env.template` file to `.env` and set the piston variables.
 
 ## Running the pipeline
 Install dependencies:
@@ -10,7 +10,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Once you have piston setup, or have made the necessary changes to the `run_submission` function in [scoring.py](scoring.py) (see below for more info), you can run the pipeline with the following command:
+Once you have piston setup and running, or have made the necessary changes to the `run_submission` function in [scoring.py](scoring.py) (see below for more info), you can run the pipeline with the following command:
 
 ```bash
 python tests_runner.py [-h] [--local_results_path LOCAL_RESULTS_PATH] [--id_column ID_COLUMN] [--max_concurrent_requests MAX_CONCURRENT_REQUESTS] [--test_batch_size TEST_BATCH_SIZE] [--dry_run] [--override]
@@ -45,7 +45,8 @@ Running on a dataset produced by evaluate.py:
 ```bash
 python tests_runner.py my_org/my-dataset my_org/my-dataset-results --max_concurrent_requests 1500
 ```
-Besides the actual results dataset, the script will also generate and upload markdown reports to the dataset's repo (/reports folder).
+
+Besides the actual results dataset, the script will also generate and upload markdown reports to the dataset's repo under `reports/my-dataset/README.md`
 
 
 
