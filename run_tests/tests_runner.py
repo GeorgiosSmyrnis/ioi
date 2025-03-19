@@ -196,7 +196,7 @@ class TestsRunner:
                                 full_result_data = {
                                     **submission,
                                     "target_subtask": target_subtask,
-                                    "code_compiles": submission["code"] and all(subtask_results.status != "CE" for subtask_results in all_subtask_results),
+                                    "code_compiles": bool(submission["code"]) and all(subtask_results.status != "CE" for subtask_results in all_subtask_results),
                                     "target_subtask_score": target_subtask_results[0].score if target_subtask_results else None,
                                     "target_subtask_status": target_subtask_results[0].status if target_subtask_results else None,
                                     "all_subtasks_points": sum([subtask_results.weighted_score for subtask_results in all_subtask_results]),
