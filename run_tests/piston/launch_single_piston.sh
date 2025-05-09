@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=piston_worker
-#SBATCH --output=/fsx/guilherme/piston/worker-logs/%x-%j.out
-#SBATCH --error=/fsx/guilherme/piston/worker-logs/%x-%j.out  # Redirect error logs to .out
-#SBATCH --cpus-per-task=2
-#SBATCH --mem-per-cpu=1950M
-#SBATCH --partition=hopper-cpu
-#SBATCH --time=48:00:00
+#SBATCH --output=%x-%j.out
+#SBATCH --tasks-per-node 1
+#SBATCH --cpus-per-task=72
+#SBATCH --nodes 1
+#SBATCH -A CGAI24022
+#SBATCH --partition=gh-dev
+#SBATCH --time=2:00:00
 
 # sometimes if a bunch of workers start at the same time pyxis dies
 sleep $(( RANDOM % 20 ))
@@ -14,7 +15,7 @@ sleep $(( RANDOM % 20 ))
 # we use 63b5654156a89c5a2ad281aface21416615d62ec056d88efe8fcd307ce73575a as the latest image requires isolate, which does not work on the HF science cluster (cgroups incompatibility)
 # feel free try with the latest image
 # the code you see below increases the very constrained piston default limits, and sets the repo url to the one hosting our IOI package
-srun --container-mounts=/fsx/guilherme/ioi2024/piston_files/packages:/piston/packages --container-image "ghcr.io#engineer-man/piston:sha256:63b5654156a89c5a2ad281aface21416615d62ec056d88efe8fcd307ce73575a" \
+srun --container-mounts=/scratch/08002/gsmyrnis/piston/packages:/piston/packages --container-image "ghcr.io#engineer-man/piston:sha256:63b5654156a89c5a2ad281aface21416615d62ec056d88efe8fcd307ce73575a" \
     bash -c "
     export PISTON_COMPILE_TIMEOUT=60000
     export PISTON_RUN_TIMEOUT=60000
